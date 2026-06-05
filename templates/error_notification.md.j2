@@ -1,0 +1,154 @@
+# {{ error_type | default('ERROR') }}: {{ error_title }}
+
+| Field | Value |
+|-------|-------|
+| Host | {{ error_host | default(inventory_hostname) }} |
+| Stage | {{ error_stage | default('N/A') }} |
+| Task | {{ error_task | default('N/A') }} |
+| Pipeline Run | {{ pipeline_run_id | default('local') }} |
+| Pipeline Link | {% if error_pipeline_url | default('') | length > 0 %}[Open Pipeline Run]({{ error_pipeline_url }}){% else %}N/A{% endif %} |
+| Timestamp | {{ error_timestamp | default(ansible_date_time.iso8601 | default('N/A')) }} |
+| Executed By | {{ pipeline_requested_by | default('Automation') }} |
+
+{% set _error_stage_name = error_stage | default('') %}
+{% set _error_task_name = error_task | default('Unknown task') %}
+{% set _error_message_text = error_message | default('Unknown error') %}
+
+## Error Details
+
+{{ error_message }}
+
+{% if _error_stage_name == 'HANA Update' %}
+{% set _hana_task_lc = _error_task_name | lower %}
+{% set _hana_targets = hana_backup_details | default(hana_backup_databases | default('')) %}
+{% if _hana_targets | string | trim | length == 0 %}
+{% if hana_databases is defined and hana_databases | length > 0 %}
+{% set _hana_targets = hana_databases | join(', ') %}
+{% elif sap_sids is defined and sap_sids | length > 0 %}
+{% set _hana_targets = sap_sids | join(', ') %}
+{% else %}
+{% set _hana_targets = sap_sid | default(error_host | default(inventory_hostname | default('N/A'))) %}
+{% endif %}
+{% endif %}
+{% set _hana_procedure_step = 'HANA update execution' %}
+{% if 'backup' in _hana_task_lc %}
+{% set _hana_procedure_step = 'pre-update database backup' %}
+{% elif 'hdbuserstore' in _hana_task_lc or 'system user' in _hana_task_lc or 'maintenance key' in _hana_task_lc %}
+{% set _hana_procedure_step = 'credential preparation and SYSTEM user activation' %}
+{% elif 'disk space' in _hana_task_lc or 'pre-flight' in _hana_task_lc %}
+{% set _hana_procedure_step = 'pre-flight disk validation' %}
+{% elif 'medium' in _hana_task_lc or 'hdblcm' in _hana_task_lc %}
+{% set _hana_procedure_step = 'hdblcm update preparation and execution' %}
+{% elif 'client' in _hana_task_lc or 'hdbinst' in _hana_task_lc %}
+{% set _hana_procedure_step = 'HANA client installation on the application host' %}
+{% elif 'root key' in _hana_task_lc %}
+{% set _hana_procedure_step = 'post-update encryption root key handling' %}
+{% endif %}
+
+## HANA Failure Report
+
+| Field | Value |
+|-------|-------|
+| Failed Task | {{ _error_task_name }} |
+| Failure Reason | {{ _error_message_text | replace('\n', ' ') }} |
+| Affected Databases / Tenants | {{ _hana_targets }} |
+| Procedure Step | {{ _hana_procedure_step }} |
+
+**Recovery Guidance**
+- Review `hdblcm`, `hdbinst`, and `hdbsql` logs on {{ error_host | default(inventory_hostname | default('the affected host')) }}.
+- Validate SYSTEMDB and tenant availability for {{ _hana_targets }} with `HDB info` and catalog backup checks.
+- If consistency cannot be confirmed, restore manually from the pre-update backup before restarting dependent SAP systems.
+{% elif _error_stage_name == 'OS Update' %}
+{% set _os_task_lc = _error_task_name | lower %}
+{% set _os_packages = os_packages_updated | default([]) %}
+{% if (_os_packages | length == 0) and updates_available is defined and updates_available.results is defined %}
+{% set _os_packages = updates_available.results | map(attribute='name') | list %}
+{% endif %}
+{% set _os_package_text = (_os_packages | join(', ')) if (_os_packages | length > 0) else 'Package list unavailable at failure time' %}
+{% set _os_paths = [os_update_log_file | default('/var/log/ansible_patch.log'), '/var/cache/dnf', '/boot'] %}
+{% set _os_procedure_step = 'OS patch execution' %}
+{% if 'stop hana' in _os_task_lc %}
+{% set _os_procedure_step = 'pre-patch HANA shutdown' %}
+{% elif 'check for available updates' in _os_task_lc %}
+{% set _os_procedure_step = 'pre-update package discovery' %}
+{% elif 'update all packages' in _os_task_lc or 'os patching' in _os_task_lc %}
+{% set _os_procedure_step = 'package installation' %}
+{% elif 'reboot' in _os_task_lc or 'wait for system to come back' in _os_task_lc or 'did not come back' in _os_task_lc %}
+{% set _os_procedure_step = 'post-patching reboot and reconnect' %}
+{% endif %}
+
+## OS Failure Report
+
+| Field | Value |
+|-------|-------|
+| Failed Task | {{ _error_task_name }} |
+| Failure Reason | {{ _error_message_text | replace('\n', ' ') }} |
+| Affected Packages | {{ _os_package_text }} |
+| Affected Paths | {{ _os_paths | join(', ') }} |
+| Procedure Step | {{ _os_procedure_step }} |
+
+**Recovery Guidance**
+- Review package transaction history with `dnf history list` and identify the failed transaction.
+- If the RPM database is consistent, use `dnf history rollback <transaction-id>` after validating the host state.
+- If rollback is not safe or the system is unbootable, restore the relevant LVM or hypervisor snapshot and verify `/boot` and mounted filesystems from console access.
+{% elif _error_stage_name == 'Kernel Update' %}
+{% set _kernel_task_lc = _error_task_name | lower %}
+{% set _kernel_procedure_step = 'kernel binary deployment and validation' %}
+{% if 'backup' in _kernel_task_lc %}
+{% set _kernel_procedure_step = 'pre-update kernel backup creation' %}
+{% elif 'copy' in _kernel_task_lc or 'deploy' in _kernel_task_lc %}
+{% set _kernel_procedure_step = 'kernel binary deployment' %}
+{% elif 'validate' in _kernel_task_lc %}
+{% set _kernel_procedure_step = 'post-deployment kernel validation' %}
+{% elif 'rollback' in _kernel_task_lc %}
+{% set _kernel_procedure_step = 'kernel rollback after failed deployment' %}
+{% endif %}
+
+## Kernel Failure Report
+
+| Field | Value |
+|-------|-------|
+| Failed Task | {{ _error_task_name }} |
+| Failure Reason | {{ _error_message_text | replace('\n', ' ') }} |
+| Rollback Performed | {{ 'true' if (rollback_performed | default(false) | bool) else 'false' }} |
+| Backup Path | {{ kernel_backup_path | default('N/A') }} |
+| Procedure Step | {{ _kernel_procedure_step }} |
+
+**Recovery Guidance**
+- Verify the kernel backup contents under {{ kernel_backup_path | default('the configured backup path') }} and confirm the rollback result.
+- Check SAP instance status with `sapcontrol -function GetProcessList` before any retry.
+- Restage the kernel medium and rerun validation only after the restored binaries are confirmed healthy.
+{% endif %}
+
+{% if error_details is defined and error_details | length > 0 %}
+### Technical Details
+```
+{{ error_details }}
+```
+{% endif %}
+
+## Recommended Actions
+
+{% set _recommended_actions = ['Check the Ansible task output and pipeline logs', 'Contact the SAP Basis team if the issue persists'] %}
+{% if error_stage | default('') == 'PreCheck' %}
+{% set _recommended_actions = ['Check Icinga health and the configured service exclusions', 'Verify SAP discovery, credentials, and target host reachability'] %}
+{% elif error_stage | default('') == 'Icinga Downtime' %}
+{% set _recommended_actions = ['Check Icinga API availability and pipeline credentials', 'Verify downtime targets and requested duration'] %}
+{% elif error_stage | default('') == 'Stop Applications' %}
+{% set _recommended_actions = ['Verify SAP Host Agent / SAPControl reachability on the target host', 'Check whether SAP and HANA instances can be stopped cleanly'] %}
+{% elif error_stage | default('') == 'OS Update' %}
+{% set _recommended_actions = ['Review package manager, reboot, and console status on the host', 'Use hypervisor or serial console access if the host did not return'] %}
+{% elif error_stage | default('') == 'HANA Update' %}
+{% set _recommended_actions = ['Check HANA credentials, backup status, and update media availability', 'Review hdblcm, hdbinst, and hdbsql output on the affected host'] %}
+{% elif error_stage | default('') == 'Kernel Update' %}
+{% set _recommended_actions = ['Verify staged kernel files and the backup path on the SAP host', 'Confirm rollback result and SAP startup status after the rollback'] %}
+{% endif %}
+{% if error_actions is defined and error_actions is not string and error_actions | length > 0 %}
+{% set _recommended_actions = error_actions %}
+{% endif %}
+{% for action in _recommended_actions %}
+- [ ] {{ action }}
+{% endfor %}
+
+---
+*Generated by SAP Maintenance Automation*

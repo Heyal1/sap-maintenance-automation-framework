@@ -1,0 +1,159 @@
+---
+# =============================================================================
+# Shared Task: precheck_shared_hana_instance.yml
+# =============================================================================
+# Captures HANA version and component metadata once per shared HANA instance.
+# =============================================================================
+
+- name: "Initialize shared HANA instance pre-check facts"
+  set_fact:
+    precheck_shared_instance_version: "{{ precheck_undetermined_version_message }}"
+    precheck_shared_instance_component_output: ""
+    precheck_shared_instance_components: []
+    precheck_shared_instance_component_discovery_path: ""
+    precheck_shared_instance_component_issue_reason: ""
+
+- name: "Detect installed HANA components for shared instance {{ shared_hana_instance.instance_name }}"
+  block:
+    - name: "Locate installed hdblcm executable for shared instance {{ shared_hana_instance.instance_name }}"
+      shell: |
+        set -o pipefail
+        hdblcm_path=$(for base in /hana/shared/{{ shared_hana_instance.instance_name }} /usr/sap/{{ shared_hana_instance.instance_name }}; do
+          if [ -d "$base" ]; then
+            find "$base" -type f -name hdblcm -print -quit
+          fi
+        done | head -1)
+        if [ -z "$hdblcm_path" ]; then
+          echo "hdblcm not found under /hana/shared/{{ shared_hana_instance.instance_name }} or /usr/sap/{{ shared_hana_instance.instance_name }}" >&2
+          exit 2
+        fi
+        printf '%s\n' "$hdblcm_path"
+      args:
+        executable: /bin/bash
+      register: precheck_shared_instance_hdblcm_path
+      changed_when: false
+      failed_when: (precheck_shared_instance_hdblcm_path.rc | int) != 0
+
+    - name: "Set shared instance hdblcm discovery path"
+      set_fact:
+        precheck_shared_instance_component_discovery_path: "{{ precheck_shared_instance_hdblcm_path.stdout | trim }}"
+
+    - name: "Run hdblcm component discovery for shared instance {{ shared_hana_instance.instance_name }}"
+      shell: |
+        set -o pipefail
+        "{{ precheck_shared_instance_component_discovery_path }}" --list_components
+      args:
+        executable: /bin/bash
+      register: precheck_shared_instance_hdblcm_components
+      changed_when: false
+      failed_when: (precheck_shared_instance_hdblcm_components.rc | int) != 0
+
+    - name: "Set detected HANA components for shared instance {{ shared_hana_instance.instance_name }}"
+      set_fact:
+        precheck_shared_instance_component_output: "{{ precheck_shared_instance_hdblcm_components.stdout | trim }}"
+        precheck_shared_instance_components: "{{ precheck_shared_instance_hdblcm_components.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+  rescue:
+    - name: "Record HANA component detection failure for shared instance {{ shared_hana_instance.instance_name }}"
+      set_fact:
+        precheck_shared_instance_component_output: "{{ precheck_undetermined_version_message }}"
+        precheck_shared_instance_components: []
+        precheck_shared_instance_component_issue_reason: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('hdblcm --list_components failed'))) }}"
+
+- name: "Record empty HANA component discovery output for shared instance {{ shared_hana_instance.instance_name }}"
+  set_fact:
+    precheck_shared_instance_component_issue_reason: "hdblcm --list_components returned no component data."
+  when:
+    - precheck_shared_instance_component_issue_reason | length == 0
+    - (precheck_shared_instance_components | default([]) | length) == 0
+    - precheck_shared_instance_component_output | default('') != precheck_undetermined_version_message
+
+- name: "Capture HANA version for shared instance {{ shared_hana_instance.instance_name }}"
+  block:
+    - name: "Run HDB version for shared instance {{ shared_hana_instance.instance_name }}"
+      shell: |
+        set -o pipefail
+        version=$(su - {{ shared_hana_instance.instance_name | lower }}adm -c "HDB version | awk '/version:/ {print \$2; exit}'")
+        if [ -z "$version" ]; then
+          echo "version output not found in HDB version" >&2
+          exit 2
+        fi
+        printf '%s\n' "$version"
+      args:
+        executable: /bin/bash
+      register: precheck_shared_instance_version_cmd
+      changed_when: false
+      failed_when: (precheck_shared_instance_version_cmd.rc | int) != 0
+
+    - name: "Set HANA version for shared instance {{ shared_hana_instance.instance_name }}"
+      set_fact:
+        precheck_shared_instance_version: "{{ precheck_shared_instance_version_cmd.stdout | trim }}"
+  rescue:
+    - name: "Mark HANA version as undetermined for shared instance {{ shared_hana_instance.instance_name }}"
+      set_fact:
+        precheck_shared_instance_version: "{{ precheck_undetermined_version_message }}"
+
+- name: "Store shared HANA instance pre-check result"
+  set_fact:
+    precheck_shared_instance_results: >-
+      {{
+        precheck_shared_instance_results
+        + [
+          {
+            'instance_name': shared_hana_instance.instance_name,
+            'instance_nr': shared_hana_instance.instance_nr,
+            'version': precheck_shared_instance_version,
+            'component_discovery_path': precheck_shared_instance_component_discovery_path,
+            'component_output': precheck_shared_instance_component_output,
+            'components': precheck_shared_instance_components
+          }
+        ]
+      }}
+
+- name: "Record shared HANA component detection issues per SID"
+  set_fact:
+    precheck_hana_prereq_issues: >-
+      {{
+        precheck_hana_prereq_issues
+        + [
+          {
+            'component': 'HANA component detection',
+            'reason': 'SID ' ~ item.sid ~ ' on instance ' ~ shared_hana_instance.instance_name ~ ': ' ~ precheck_shared_instance_component_issue_reason,
+            'sid': item.sid,
+            'instance_name': shared_hana_instance.instance_name,
+            'instance_nr': shared_hana_instance.instance_nr
+          }
+        ]
+      }}
+  loop: "{{ shared_hana_instance.tenants | default([]) }}"
+  loop_control:
+    label: "{{ item.sid }}"
+  when: precheck_shared_instance_component_issue_reason | length > 0
+
+- name: "Record shared HANA version validation issues per SID"
+  set_fact:
+    precheck_version_validation_issues: >-
+      {{
+        precheck_version_validation_issues
+        + [
+          {
+            'component': 'HANA database version',
+            'reason': _shared_version_reason,
+            'sid': item.sid,
+            'instance_name': shared_hana_instance.instance_name,
+            'instance_nr': shared_hana_instance.instance_nr
+          }
+        ]
+      }}
+  loop: "{{ shared_hana_instance.tenants | default([]) }}"
+  loop_control:
+    label: "{{ item.sid }}"
+  vars:
+    _shared_version_reason: >-
+      {{
+        precheck_undetermined_version_message
+        if precheck_shared_instance_version == precheck_undetermined_version_message
+        else 'Invalid version value: ' ~ precheck_shared_instance_version
+      }}
+  when:
+    - precheck_shared_instance_version == precheck_undetermined_version_message
+      or not ((precheck_shared_instance_version | string) is match('^[0-9]+(\.[0-9]+)+$'))

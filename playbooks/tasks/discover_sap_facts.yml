@@ -1,0 +1,23 @@
+# ============================================================================
+# Shared SAP Discovery Tasks
+# ============================================================================
+# Detects SAP instances and sets system facts.
+# Included by all maintenance playbooks via include_tasks.
+#
+# For Icinga configuration, also include discover_icinga_facts.yml
+# ============================================================================
+
+- name: "Detect SAP Instances"
+  sap.sap_operations.host_info:
+  register: sap_info
+  failed_when: >-
+    (sap_info.msg is defined and 'SOAP' in (sap_info.msg | upper))
+    or (sap_info.instances | default([]) | length == 0)
+
+- name: "Set System Facts"
+  set_fact:
+    sap_sid: "{{ sap_info.instances[0].mSid | default('') }}"
+    is_netweaver: "{{ sap_info.instances | default([]) | selectattr('ProcessList', 'defined') | map(attribute='ProcessList') | flatten | selectattr('name', 'search', 'disp.+work|msg_server') | list | length > 0 }}"
+    is_hana: "{{ sap_info.databases | default([]) | length > 0 }}"
+    anchor_instance_nr: "{{ sap_info.instances[0].mSystemNumber | default('00') }}"
+    is_kernel_only_scenario: "{{ do_kernel|bool and not do_hana|bool and not do_os_patch|bool }}"

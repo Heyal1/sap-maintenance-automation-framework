@@ -1,0 +1,129 @@
+---
+# =============================================================================
+# Shared Task: shared_hana_host_health_check.yml
+# =============================================================================
+# Runs a lightweight host health gate after a shared HANA instance failure. The
+# next instance update can continue only when disk, memory, shared memory, and
+# basic host responsiveness all look healthy.
+# =============================================================================
+
+- name: "Run shared-host disk stop gate after failed instance {{ shared_hana_instance_ctx.instance_name }}"
+  block:
+    - name: "Check shared-host disk space after failed instance {{ shared_hana_instance_ctx.instance_name }}"
+      include_tasks: tasks/preflight_disk_check.yml
+      vars:
+        preflight_disk_profiles:
+          - hana
+
+    - name: "Record shared-host disk stop gate result"
+      set_fact:
+        _shared_hana_disk_stop_gate:
+          status: "PASS"
+          details: "{{ preflight_disk_results | default([]) }}"
+  rescue:
+    - name: "Record shared-host disk stop gate failure"
+      set_fact:
+        _shared_hana_disk_stop_gate:
+          status: "FAIL"
+          details: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown disk health error'))) }}"
+
+- name: "Collect available memory after failed instance {{ shared_hana_instance_ctx.instance_name }}"
+  shell: "awk '/MemAvailable:/ {print $2; exit}' /proc/meminfo"
+  register: _shared_hana_mem_available
+  changed_when: false
+  failed_when: false
+
+- name: "Assess available memory after failed instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    _shared_hana_memory_stop_gate:
+      status: >-
+        {{
+          'PASS'
+          if ((_shared_hana_mem_available.rc | int) == 0 and (_shared_hana_mem_available.stdout | trim | length) > 0 and (_shared_hana_mem_available.stdout | trim | int) >= 1048576)
+          else (
+            'FAIL'
+            if ((_shared_hana_mem_available.rc | int) == 0 and (_shared_hana_mem_available.stdout | trim | length) > 0)
+            else 'INDETERMINATE'
+          )
+        }}
+      available_kb: "{{ (_shared_hana_mem_available.stdout | trim | int) if ((_shared_hana_mem_available.rc | int) == 0 and (_shared_hana_mem_available.stdout | trim | length) > 0) else 0 }}"
+      required_kb: 1048576
+      details: "{{ _shared_hana_mem_available.stderr | default('') | trim }}"
+
+- name: "Check shared memory visibility after failed instance {{ shared_hana_instance_ctx.instance_name }}"
+  command:
+    argv:
+      - ipcs
+      - -m
+  register: _shared_hana_ipcs
+  changed_when: false
+  failed_when: false
+
+- name: "Assess shared memory visibility after failed instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    _shared_hana_shared_memory_stop_gate:
+      status: "{{ 'PASS' if (_shared_hana_ipcs.rc | int) == 0 else 'INDETERMINATE' }}"
+      details: >-
+        {{
+          ((_shared_hana_ipcs.stdout_lines | default([]) | length) | string) ~ ' line(s) reported'
+          if (_shared_hana_ipcs.rc | int) == 0
+          else (_shared_hana_ipcs.stderr | default('Unable to inspect shared memory segments') | trim)
+        }}
+
+- name: "Verify host responsiveness after failed instance {{ shared_hana_instance_ctx.instance_name }}"
+  command:
+    argv:
+      - uptime
+  register: _shared_hana_uptime
+  changed_when: false
+  failed_when: false
+
+- name: "Assess host responsiveness after failed instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    _shared_hana_host_responsiveness_stop_gate:
+      status: "{{ 'PASS' if (_shared_hana_uptime.rc | int) == 0 else 'FAIL' }}"
+      details: >-
+        {{
+          _shared_hana_uptime.stdout | default('') | trim
+          if (_shared_hana_uptime.rc | int) == 0
+          else (_shared_hana_uptime.stderr | default('Host did not respond to uptime command') | trim)
+        }}
+
+- name: "Assemble shared-host stop gate result"
+  set_fact:
+    _shared_hana_post_failure_health_check:
+      status: >-
+        {{
+          'PASS'
+          if (
+            (_shared_hana_disk_stop_gate.status == 'PASS')
+            and (_shared_hana_memory_stop_gate.status == 'PASS')
+            and (_shared_hana_shared_memory_stop_gate.status == 'PASS')
+            and (_shared_hana_host_responsiveness_stop_gate.status == 'PASS')
+          )
+          else (
+            'FAIL'
+            if (
+              (_shared_hana_disk_stop_gate.status == 'FAIL')
+              or (_shared_hana_memory_stop_gate.status == 'FAIL')
+              or (_shared_hana_host_responsiveness_stop_gate.status == 'FAIL')
+            )
+            else 'INDETERMINATE'
+          )
+        }}
+      disk: "{{ _shared_hana_disk_stop_gate }}"
+      memory: "{{ _shared_hana_memory_stop_gate }}"
+      shared_memory: "{{ _shared_hana_shared_memory_stop_gate }}"
+      host_responsiveness: "{{ _shared_hana_host_responsiveness_stop_gate }}"
+
+- name: "Set shared-host continuation gate after failed instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    shared_hana_last_post_failure_health_check: "{{ _shared_hana_post_failure_health_check }}"
+    shared_hana_halt_remaining_updates: "{{ _shared_hana_post_failure_health_check.status != 'PASS' }}"
+    shared_hana_halt_remaining_updates_reason: >-
+      {{
+        ''
+        if _shared_hana_post_failure_health_check.status == 'PASS'
+        else
+        'Shared-host health gate after failed instance ' ~ shared_hana_instance_ctx.instance_name ~ ' returned ' ~ _shared_hana_post_failure_health_check.status ~ '.'
+      }}

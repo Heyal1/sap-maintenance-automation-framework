@@ -1,0 +1,133 @@
+---
+# =============================================================================
+# Shared Task: shared_hana_start_instance.yml
+# =============================================================================
+# Restarts one shared HANA instance in reverse tier order, then restarts the
+# tenant application hosts that were running before maintenance.
+# =============================================================================
+
+- name: "Initialize shared tenant state collection for instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    shared_hana_instance_tenant_states: []
+
+- name: "Load shared tenant states for instance {{ shared_hana_instance_ctx.instance_name }}"
+  include_tasks: tasks/shared_hana_load_tenant_state.yml
+  loop: "{{ shared_hana_instance_ctx.tenants | default([]) }}"
+  loop_control:
+    loop_var: shared_hana_tenant_ctx
+    label: "{{ shared_hana_tenant_ctx.sid }}"
+
+- name: "Derive shared HANA start state for instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    _shared_hana_instance_db_state: >-
+      {{
+        (
+          shared_hana_instance_tenant_states | default([])
+          | map(attribute='database_state')
+          | select('defined')
+          | list
+          | first
+        ) | default({})
+      }}
+    _shared_hana_instance_db_was_running: >-
+      {{
+        shared_hana_instance_tenant_states | default([])
+        | selectattr('database_state.was_running', 'defined')
+        | selectattr('database_state.was_running')
+        | list
+        | length > 0
+      }}
+
+- name: "Leave shared HANA instance {{ shared_hana_instance_ctx.instance_name }} unchanged"
+  debug:
+    msg: "Shared HANA instance {{ shared_hana_instance_ctx.instance_name }} (HDB{{ shared_hana_instance_ctx.instance_nr }}) was stopped before maintenance. Leaving it stopped."
+  when: not (_shared_hana_instance_db_was_running | default(false) | bool)
+
+- name: "Start shared HANA database instance {{ shared_hana_instance_ctx.instance_name }}"
+  sap.sap_operations.system:
+    instance_number: "{{ shared_hana_instance_ctx.instance_nr }}"
+    state: started
+    wait: true
+    wait_timeout: "{{ sap_start_timeout_seconds }}"
+  when:
+    - _manage_database_lifecycle | default(false) | bool
+    - _shared_hana_instance_db_was_running | default(false) | bool
+
+- name: "Refresh shared HANA discovery after starting instance {{ shared_hana_instance_ctx.instance_name }}"
+  sap.sap_operations.host_info:
+  register: _shared_hana_db_start_verification
+  failed_when: >-
+    (_shared_hana_db_start_verification.msg is defined and 'SOAP' in (_shared_hana_db_start_verification.msg | upper))
+    or (_shared_hana_db_start_verification.instances | default([]) | length == 0)
+  when:
+    - _manage_database_lifecycle | default(false) | bool
+    - _shared_hana_instance_db_was_running | default(false) | bool
+
+- name: "Verify shared HANA instance {{ shared_hana_instance_ctx.instance_name }} reached running state"
+  assert:
+    that:
+      - (_shared_started_db_processes | length) > 0
+      - (_shared_green_db_processes | length) == (_shared_started_db_processes | length)
+    fail_msg: "Shared HANA instance {{ shared_hana_instance_ctx.instance_name }} (HDB{{ shared_hana_instance_ctx.instance_nr }}) did not reach the expected running state."
+  vars:
+    _shared_started_db_instances: >-
+      {{
+        _shared_hana_db_start_verification.instances | default([])
+        | selectattr('mSystemNumber', 'equalto', shared_hana_instance_ctx.instance_nr)
+        | list
+      }}
+    _shared_started_db_processes: "{{ _shared_started_db_instances | map(attribute='ProcessList') | select('defined') | flatten | list }}"
+    _shared_green_db_processes: >-
+      {{
+        (
+          _shared_started_db_instances
+          | map(attribute='ProcessList')
+          | select('defined')
+          | flatten
+          | selectattr('dispstatus', 'equalto', 'SAPControl-GREEN')
+          | list
+        )
+        +
+        (
+          _shared_started_db_instances
+          | map(attribute='ProcessList')
+          | select('defined')
+          | flatten
+          | selectattr('dispstatus', 'equalto', 'GREEN')
+          | list
+        )
+      }}
+  when:
+    - _manage_database_lifecycle | default(false) | bool
+    - _shared_hana_instance_db_was_running | default(false) | bool
+
+- name: "Restart shared tenant application dependencies for instance {{ shared_hana_instance_ctx.instance_name }}"
+  include_tasks: tasks/shared_hana_start_tenant.yml
+  loop: "{{ shared_hana_instance_tenant_states | sort(attribute='tier_rank', reverse=true) }}"
+  loop_control:
+    loop_var: shared_hana_tenant_state
+    label: "{{ shared_hana_tenant_state.sid }}"
+  when:
+    - _manage_application_lifecycle | default(false) | bool
+    - _shared_hana_instance_db_was_running | default(false) | bool
+
+- name: "Record shared HANA start results for instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    shared_hana_start_results: >-
+      {%- set ns = namespace(items=shared_hana_start_results | default([])) -%}
+      {%- for tenant_state in shared_hana_instance_tenant_states | default([]) -%}
+        {%- set tenant_was_running = tenant_state.was_running | default(false) | bool -%}
+        {%- set db_was_running = _shared_hana_instance_db_was_running | default(false) | bool -%}
+        {%- set ns.items = ns.items + [
+          tenant_state | combine(
+            {
+              'database_pre_maintenance_state': tenant_state.database_state.pre_maintenance_state | default('stopped'),
+              'database_post_maintenance_state': 'running' if db_was_running else 'stopped',
+              'post_maintenance_state': 'running' if (tenant_was_running and db_was_running) else 'stopped',
+              'start_verification': 'VERIFIED' if (tenant_was_running and db_was_running) else 'SKIPPED'
+            },
+            recursive=true
+          )
+        ] -%}
+      {%- endfor -%}
+      {{ ns.items }}

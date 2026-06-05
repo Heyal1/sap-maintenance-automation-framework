@@ -1,0 +1,110 @@
+---
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileCopyrightText: 2023 Red Hat, Project Atmosphere
+#
+# Copyright 2023 Red Hat, Project Atmosphere
+#
+# This program is free software: you can redistribute it and/or modify it under the terms of the GNU
+# General Public License as published by the Free Software Foundation, version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+# even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# You should have received a copy of the GNU General Public License along with this program.
+# If not, see <https://www.gnu.org/licenses/>.
+
+- name: Prepare necessary files for SAP HANA update
+  vars:
+    random_code: "{{ lookup('ansible.builtin.password', '/dev/null chars=ascii_lowercase,digits length=8') }}" # noqa: var-naming[no-role-prefix]
+  block:
+    - name: Create HANA update configuration file from template
+      ansible.builtin.template:
+        src: update.j2
+        dest: ~/update.{{ hana_update_sid }}.{{ random_code }}.cfg
+        owner: root
+        group: root
+        mode: "0400"
+      become: true
+      become_user: root
+      register: hana_update_update_cfg
+
+    - name: Prepare hdb_passwords.xml from template
+      ansible.builtin.template:
+        src: hdb_passwords.j2
+        dest: ~/hdb_passwords.{{ hana_update_sid }}.{{ random_code }}.xml
+        owner: root
+        group: root
+        mode: "0400"
+      become: true
+      become_user: root
+      register: hana_update_hdb_passwords
+      no_log: true
+      # TODO: More passwords required?
+      # See https://github.com/Azure/sap-automation/blob/experimental/deploy/ansible/
+      # roles-db/4.0.0-hdb-install/templates/HANA_2_00_055_v1_install.rsp.xml.j2
+
+- name: Locate hdblcm executable in component medium
+  ansible.builtin.find:
+    paths: "{{ hana_update_component_medium }}"
+    patterns: "hdblcm"
+    recurse: true
+    file_type: file
+  register: hana_update_hdblcm_search
+  become: true
+  become_user: root
+
+- name: Verify hdblcm found
+  ansible.builtin.assert:
+    that:
+      - hana_update_hdblcm_search.matched > 0
+    fail_msg: "hdblcm not found under {{ hana_update_component_medium }}. Check staging."
+    success_msg: "Found hdblcm at {{ hana_update_hdblcm_search.files[0].path }}"
+
+- name: Set hdblcm path
+  ansible.builtin.set_fact:
+    hana_update_hdblcm_path: "{{ hana_update_hdblcm_search.files[0].path }}"
+
+- name: Run actual SAP HANA update
+  block:
+    - name: Start HANA update
+      ansible.builtin.shell:
+        cmd: >
+          set -o pipefail;
+          cat {{ hana_update_hdb_passwords.dest }} |
+          (
+          {% if (hana_update_options.hana_update_hdb_installer_trace_file is defined) -%}
+          HDB_INSTALLER_TRACE_FILE={{ hana_update_options.hana_update_hdb_installer_trace_file }}
+          {% endif %}
+          {% if (hana_update_options.hdblcm_logdir_copy is defined) -%}
+          HDBLCM_LOGDIR_COPY={{ hana_update_options.hdblcm_logdir_copy }}
+          {% endif %}
+          {{ hana_update_hdblcm_path }}
+          --configfile={{ hana_update_update_cfg.dest }}
+          --read_password_from_stdin=xml
+          --batch
+          )
+      become: true
+      become_user: root
+      register: hana_update_run
+      failed_when: hana_update_run.rc > 0
+      changed_when: true
+
+  rescue:
+    - name: Rescue SAP HANA update if it fails
+      ansible.builtin.include_tasks: hdb_update_rescue.yml
+
+  always:
+    - name: Cleanup hdb_passwords.xml file
+      ansible.builtin.file:
+        path: "{{ hana_update_hdb_passwords.dest }}"
+        state: absent
+      when: hana_update_cleanup
+      become: true
+      become_user: root

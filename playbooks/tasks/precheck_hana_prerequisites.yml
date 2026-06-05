@@ -1,0 +1,276 @@
+---
+# =============================================================================
+# Shared Task: precheck_hana_prerequisites.yml
+# =============================================================================
+# Validates HANA-specific PreCheck prerequisites before maintenance starts.
+#
+# Scope:
+#   1. Enforce email_recipient for HANA runs
+#   2. Detect installed HANA components via hdblcm --list_components
+#   3. Validate at least one non-destructive HANA authentication path
+#
+# Included by: 03_maintenance_precheck.yml (when do_hana=true)
+# =============================================================================
+
+- name: "Initialize HANA pre-check prerequisite facts"
+  set_fact:
+    precheck_hana_prereq_issues: []
+    precheck_hana_component_output: ""
+    precheck_hana_components: []
+    precheck_hana_component_discovery_path: ""
+    precheck_hana_credential_ok: false
+    precheck_hana_credential_source: "unavailable"
+    precheck_hana_credential_failure_reason: "Credential validation not attempted."
+    precheck_hdb_test_admin_ok: false
+    precheck_hdb_test_admin_reason: Secret store admin credential not available in PreCheck environment.
+    precheck_hdb_test_system_password_ok: false
+    precheck_hdb_test_system_password_reason: Secret store SYSTEM credential not available in PreCheck environment.
+
+- name: "Resolve dedicated HANA PreCheck credentials from inventory"
+  set_fact:
+    precheck_hana_admin_password: >-
+      {{
+        lookup('env', (staging_customer | default('', true) | upper) ~ '-HANA-' ~ (sap_sid | default('', true) | upper) ~ '-HANA_ADMIN')
+        | default(lookup('env', (staging_customer | default('', true) | upper) ~ '_HANA_' ~ (sap_sid | default('', true) | upper) ~ '_HANA_ADMIN'), true)
+        | default('', true)
+      }}
+    precheck_hana_system_password: >-
+      {{
+        lookup('env', (staging_customer | default('', true) | upper) ~ '-HANA-' ~ (sap_sid | default('', true) | upper) ~ '-SYSTEM')
+        | default(lookup('env', (staging_customer | default('', true) | upper) ~ '_HANA_' ~ (sap_sid | default('', true) | upper) ~ '_SYSTEM'), true)
+        | default('', true)
+      }}
+  no_log: true
+  when: is_hana | default(false)
+
+- name: "Record missing HANA email recipient"
+  set_fact:
+    precheck_hana_prereq_issues: "{{ precheck_hana_prereq_issues + [ {'component': 'email_recipient', 'reason': 'HANA updates require email_recipient to be set to a value other than none.'} ] }}"
+  when: (email_recipient | default('none') | string | trim | lower) in ['', 'none']
+
+- name: "Detect installed HANA components"
+  block:
+    - name: "Locate installed hdblcm executable"
+      shell: |
+        set -o pipefail
+        hdblcm_path=$(for base in /hana/shared/{{ sap_sid }} /usr/sap/{{ sap_sid }}; do
+          if [ -d "$base" ]; then
+            find "$base" -type f -name hdblcm -print -quit
+          fi
+        done | head -1)
+        if [ -z "$hdblcm_path" ]; then
+          echo "hdblcm not found under /hana/shared/{{ sap_sid }} or /usr/sap/{{ sap_sid }}" >&2
+          exit 2
+        fi
+        printf '%s\n' "$hdblcm_path"
+      args:
+        executable: /bin/bash
+      register: precheck_hdblcm_path
+      changed_when: false
+      failed_when: (precheck_hdblcm_path.rc | int) != 0
+
+    - name: "Set hdblcm discovery path"
+      set_fact:
+        precheck_hana_component_discovery_path: "{{ precheck_hdblcm_path.stdout | trim }}"
+
+    - name: "Run hdblcm component discovery"
+      shell: |
+        set -o pipefail
+        "{{ precheck_hana_component_discovery_path }}" --action=print_component_list --batch
+      args:
+        executable: /bin/bash
+      register: precheck_hdblcm_components
+      changed_when: false
+      failed_when: (precheck_hdblcm_components.rc | int) != 0
+
+    - name: "Set detected HANA components"
+      set_fact:
+        precheck_hana_component_output: "{{ precheck_hdblcm_components.stdout | trim }}"
+        precheck_hana_components: "{{ precheck_hdblcm_components.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+  rescue:
+    - name: "Record HANA component detection failure"
+      set_fact:
+        precheck_hana_component_output: "{{ precheck_undetermined_version_message }}"
+        precheck_hana_components: []
+        precheck_hana_prereq_issues: >-
+          {{
+            precheck_hana_prereq_issues
+            + [
+              {
+                'component': 'HANA component detection',
+                'reason': ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('hdblcm --list_components failed')))
+              }
+            ]
+          }}
+  when: is_hana | default(false)
+
+- name: "Record empty HANA component discovery output"
+  set_fact:
+    precheck_hana_prereq_issues: "{{ precheck_hana_prereq_issues + [ {'component': 'HANA component detection', 'reason': 'hdblcm --list_components returned no component data.'} ] }}"
+  when:
+    - is_hana | default(false)
+    - (precheck_hana_components | default([]) | length) == 0
+    - precheck_hana_component_output | default('') != precheck_undetermined_version_message
+
+- name: "Test hdbuserstore key DEFAULT"
+  shell: |
+    su - {{ sap_sid | lower }}adm -c \
+      "hdbsql -U DEFAULT -d SYSTEMDB -jaxC \"SELECT 'OK' FROM DUMMY\"" 2>&1
+  register: precheck_hdb_test_default
+  changed_when: false
+  failed_when: false
+  when: is_hana | default(false)
+
+- name: "Test hdbuserstore key SYSTEM"
+  shell: |
+    su - {{ sap_sid | lower }}adm -c \
+      "hdbsql -U SYSTEM -d SYSTEMDB -jaxC \"SELECT 'OK' FROM DUMMY\"" 2>&1
+  register: precheck_hdb_test_system
+  changed_when: false
+  failed_when: false
+  when:
+    - is_hana | default(false)
+    - "'OK' not in (precheck_hdb_test_default.stdout | default(''))"
+
+- name: "Validate HANA admin credential via temporary userstore key"
+  block:
+    - name: "Create temporary admin pre-check key"
+      sap.sap_operations.hdbuserstore:
+        key: _PRECHECK_ADMIN_TMP
+        env: "localhost:3{{ anchor_instance_nr }}13"
+        username: "{{ lookup('env', 'HANA_ADMIN_USER') | default('HANA_ADMIN', true) }}"
+        password: "{{ precheck_hana_admin_password }}"
+        force: true
+      become_user: "{{ sap_sid | lower }}adm"
+      become_flags: -i
+      no_log: true
+      vars:
+        ansible_python_interpreter: "/usr/libexec/platform-python -E"
+
+    - name: "Verify temporary admin pre-check key"
+      shell: |
+        su - {{ sap_sid | lower }}adm -c \
+          "hdbsql -U _PRECHECK_ADMIN_TMP -d SYSTEMDB -jaxC \"SELECT 'OK' FROM DUMMY\"" 2>&1
+      register: precheck_hdb_test_admin
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: "Set admin credential test result"
+      set_fact:
+        precheck_hdb_test_admin_ok: "{{ 'OK' in (precheck_hdb_test_admin.stdout | default('')) }}"
+        precheck_hdb_test_admin_reason: "{{ (precheck_hdb_test_admin.stdout | default('Admin credential validation returned no output (rc=' ~ (precheck_hdb_test_admin.rc | default(-1) | string) ~ ')', true)) | trim }}"
+  rescue:
+    - name: "Record admin credential validation failure"
+      set_fact:
+        precheck_hdb_test_admin_ok: false
+        precheck_hdb_test_admin_reason: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Admin credential validation failed'))) }}"
+  always:
+    - name: "Remove temporary admin pre-check key"
+      sap.sap_operations.hdbuserstore:
+        key: _PRECHECK_ADMIN_TMP
+        state: absent
+      become_user: "{{ sap_sid | lower }}adm"
+      become_flags: -i
+      vars:
+        ansible_python_interpreter: "/usr/libexec/platform-python -E"
+      ignore_errors: true
+  when:
+    - is_hana | default(false)
+    - "'OK' not in (precheck_hdb_test_default.stdout | default(''))"
+    - "'OK' not in (precheck_hdb_test_system.stdout | default(''))"
+    - (precheck_hana_admin_password | default('') | length) > 0
+
+- name: "Validate HANA SYSTEM credential via temporary userstore key"
+  block:
+    - name: "Create temporary SYSTEM pre-check key"
+      sap.sap_operations.hdbuserstore:
+        key: _PRECHECK_SYSTEM_TMP
+        env: "localhost:3{{ anchor_instance_nr }}13"
+        username: SYSTEM
+        password: "{{ precheck_hana_system_password }}"
+        force: true
+      become_user: "{{ sap_sid | lower }}adm"
+      become_flags: -i
+      no_log: true
+      vars:
+        ansible_python_interpreter: "/usr/libexec/platform-python -E"
+
+    - name: "Verify temporary SYSTEM pre-check key"
+      shell: |
+        su - {{ sap_sid | lower }}adm -c \
+          "hdbsql -U _PRECHECK_SYSTEM_TMP -d SYSTEMDB -jaxC \"SELECT 'OK' FROM DUMMY\"" 2>&1
+      register: precheck_hdb_test_system_password
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: "Set SYSTEM credential test result"
+      set_fact:
+        precheck_hdb_test_system_password_ok: "{{ 'OK' in (precheck_hdb_test_system_password.stdout | default('')) }}"
+        precheck_hdb_test_system_password_reason: "{{ (precheck_hdb_test_system_password.stdout | default('SYSTEM credential validation returned no output (rc=' ~ (precheck_hdb_test_system_password.rc | default(-1) | string) ~ ')', true)) | trim }}"
+  rescue:
+    - name: "Record SYSTEM credential validation failure"
+      set_fact:
+        precheck_hdb_test_system_password_ok: false
+        precheck_hdb_test_system_password_reason: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('SYSTEM credential validation failed'))) }}"
+  always:
+    - name: "Remove temporary SYSTEM pre-check key"
+      sap.sap_operations.hdbuserstore:
+        key: _PRECHECK_SYSTEM_TMP
+        state: absent
+      become_user: "{{ sap_sid | lower }}adm"
+      become_flags: -i
+      vars:
+        ansible_python_interpreter: "/usr/libexec/platform-python -E"
+      ignore_errors: true
+  when:
+    - is_hana | default(false)
+    - "'OK' not in (precheck_hdb_test_default.stdout | default(''))"
+    - "'OK' not in (precheck_hdb_test_system.stdout | default(''))"
+    - not (precheck_hdb_test_admin_ok | default(false) | bool)
+    - (precheck_hana_system_password | default('') | length) > 0
+
+- name: "Set HANA credential validation result"
+  set_fact:
+    precheck_hana_credential_ok: >-
+      {{
+        ('OK' in (precheck_hdb_test_default.stdout | default('')))
+        or ('OK' in (precheck_hdb_test_system.stdout | default('')))
+        or (precheck_hdb_test_admin_ok | default(false) | bool)
+        or (precheck_hdb_test_system_password_ok | default(false) | bool)
+      }}
+    precheck_hana_credential_source: >-
+      {%- if 'OK' in (precheck_hdb_test_default.stdout | default('')) -%}
+      hdbuserstore DEFAULT
+      {%- elif 'OK' in (precheck_hdb_test_system.stdout | default('')) -%}
+      hdbuserstore SYSTEM
+      {%- elif precheck_hdb_test_admin_ok | default(false) | bool -%}
+      secret store admin credential
+      {%- elif precheck_hdb_test_system_password_ok | default(false) | bool -%}
+      secret store SYSTEM credential
+      {%- else -%}
+      unavailable
+      {%- endif -%}
+    precheck_hana_credential_failure_reason: >-
+      DEFAULT={{ ((precheck_hdb_test_default.stdout | default('not attempted', true)) | trim) if (precheck_hdb_test_default is defined) else 'not attempted' }};
+      SYSTEM={{ ((precheck_hdb_test_system.stdout | default('not attempted', true)) | trim) if (precheck_hdb_test_system is defined) else 'not attempted' }};
+      ADMIN={{ precheck_hdb_test_admin_reason | default('not attempted', true) }};
+      SYSTEM_PASSWORD={{ precheck_hdb_test_system_password_reason | default('not attempted', true) }}
+  when: is_hana | default(false)
+
+- name: "Record failed HANA credential validation"
+  set_fact:
+    precheck_hana_prereq_issues: >-
+      {{
+        precheck_hana_prereq_issues
+        + [
+          {
+            'component': 'HANA credential validation',
+            'reason': 'SID ' ~ sap_sid ~ ' using ' ~ precheck_hana_credential_source ~ ' failed. ' ~ precheck_hana_credential_failure_reason
+          }
+        ]
+      }}
+  when:
+    - is_hana | default(false)
+    - not (precheck_hana_credential_ok | default(false) | bool)

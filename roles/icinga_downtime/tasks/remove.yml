@@ -1,0 +1,89 @@
+---
+# =============================================================================
+# Icinga Downtime - REMOVE Action
+# =============================================================================
+# Dedicated systems remove the historical host downtime.
+# Shared HANA systems remove all author-created downtimes on the resolved
+# target hosts used for per-SID service downtime scheduling.
+# =============================================================================
+
+- name: "Remove shared HANA service downtimes"
+  ansible.builtin.uri:
+    url: "{{ icinga_url }}/v1/actions/remove-downtime"
+    method: POST
+    user: "{{ icinga_user }}"
+    password: "{{ icinga_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    headers:
+      Accept: "application/json"
+    body_format: json
+    body:
+      type: "Downtime"
+      filter: "(host.name == filterHost || host.address == filterAddress) && downtime.author == filterAuthor"
+      filter_vars:
+        filterHost: "{{ item }}"
+        filterAddress: "{{ hostvars[item].ansible_host | default(item) }}"
+        filterAuthor: "{{ current_downtime_author }}"
+    status_code: [200, 404]
+  loop: "{{ icinga_service_downtime_hosts | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  register: downtime_remove_service_result
+  delegate_to: localhost
+  retries: 3
+  delay: 10
+  until: downtime_remove_service_result.status in [200, 404]
+  when:
+    - _icinga_use_shared_sid_downtime | default(false) | bool
+    - (icinga_service_downtime_hosts | default([]) | length) > 0
+
+- name: "Shared HANA downtime removed"
+  ansible.builtin.debug:
+    msg: >-
+      Host: {{ inventory_hostname }} |
+      Target hosts: {{ icinga_service_downtime_hosts | join(', ') }}
+  when:
+    - _icinga_use_shared_sid_downtime | default(false) | bool
+    - (icinga_service_downtime_hosts | default([]) | length) > 0
+
+- name: "No shared HANA downtime hosts resolved"
+  ansible.builtin.debug:
+    msg: "Host: {{ inventory_hostname }} | No per-SID Icinga downtimes required cleanup"
+  when:
+    - _icinga_use_shared_sid_downtime | default(false) | bool
+    - (icinga_service_downtime_hosts | default([]) | length) == 0
+
+- name: "Remove HOST downtime"
+  ansible.builtin.uri:
+    url: "{{ icinga_url }}/v1/actions/remove-downtime"
+    method: POST
+    user: "{{ icinga_user }}"
+    password: "{{ icinga_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    headers:
+      Accept: "application/json"
+    body_format: json
+    body:
+      type: "Downtime"
+      filter: "(host.name == filterHost || host.address == filterAddress) && downtime.author == filterAuthor"
+      filter_vars:
+        filterHost: "{{ inventory_hostname }}"
+        filterAddress: "{{ ansible_host | default(inventory_hostname) }}"
+        filterAuthor: "{{ current_downtime_author }}"
+    status_code: [200, 404]
+  register: downtime_remove_result
+  delegate_to: localhost
+  retries: 3
+  delay: 10
+  until: downtime_remove_result.status in [200, 404]
+  when: not (_icinga_use_shared_sid_downtime | default(false) | bool)
+
+- name: "Downtime removed"
+  ansible.builtin.debug:
+    msg: >-
+      Host: {{ inventory_hostname }} |
+      {% if downtime_remove_result.status == 404 %}No active downtimes found (already removed or never set)
+      {% else %}Removed: {{ downtime_remove_result.json.results | length }} downtime(s){% endif %}
+  when: not (_icinga_use_shared_sid_downtime | default(false) | bool)

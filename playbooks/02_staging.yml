@@ -1,0 +1,909 @@
+---
+# ============================================================================
+# SAP STAGING & DISTRIBUTION
+# ============================================================================
+# Directory Layout on Controller:
+#   /home/aktansible/sap_staging/
+#     source/                              <- Raw SAR/EXE files (input)
+#     prepared/{customer}_{environment}_{run_id}/
+#       kernel/                            <- Extracted kernel binaries
+#       hana/                              <- Extracted HANA medium (hdblcm etc.)
+#       hostagent/                         <- Hostagent SARs (not extracted)
+# Flow:
+#   1. Collect files from source/ (local) or SAP Download Basket
+#   3. Filter by selected components (pipeline checkboxes)
+#   4. Extract into prepared/{customer}/{env}/{component}/
+#   5. Distribute to remote target hosts by SAP system type
+# ============================================================================
+
+- name: "SAP Staging & Distribution"
+  hosts: all
+  gather_facts: true
+  serial: 10
+  max_fail_percentage: 0
+
+  vars:
+    # --- Configuration ---
+    base_staging_dir: "/home/aktansible/sap_staging"
+    source_dir: "{{ source_directory | default(base_staging_dir + '/source') }}"
+    staging_run_id: >-
+      {{
+        pipeline_run_id
+        | default(lookup('ansible.builtin.env', 'BUILD_BUILDID'), true)
+        | default('manual-' ~ lookup('ansible.builtin.pipe', 'date +%Y%m%d%H%M%S'), true)
+        | string
+        | trim
+      }}
+    stage_kernel_selected: "{{ stage_kernel | default(true) | bool }}"
+    stage_hana_selected: "{{ stage_hana | default(true) | bool }}"
+    stage_hostagent_selected: "{{ stage_hostagent | default(true) | bool }}"
+    component_filter_active: "{{ not (stage_kernel_selected and stage_hana_selected and stage_hostagent_selected) }}"
+    staging_package_types_allowed:
+      - kernel
+      - hana
+      - hostagent
+
+    # --- PREPARED DIRECTORY: Customer / Environment / Run ---
+    # Format: /home/aktansible/sap_staging/prepared/{customer}_{environment}_{run_id}/{component}/
+    prepared_dir: "{{ base_staging_dir }}/prepared/{{ staging_customer | default('UNKNOWN') }}_{{ staging_environment | default('UNKNOWN') }}_{{ staging_run_id }}"
+
+    # Prepared output paths (flat per component, no version nesting)
+    kernel_extract_dir: "{{ prepared_dir }}/kernel"
+    hana_extract_dir: "{{ prepared_dir }}/hana"
+    hana_client_extract_dir: "{{ prepared_dir }}/hana_client"
+    hostagent_dir: "{{ prepared_dir }}/hostagent"
+
+    # Remote targets - simple paths on target hosts
+    # Uses /usr/sap/tmp/staging/ as base - the SAP standard temp location, accessible by all SAP users
+    remote_kernel_target: "{{ remote_staging_dir | default('/usr/sap/tmp/staging') }}/kernel"
+    remote_hana_target: "{{ remote_hana_staging_dir | default('/usr/sap/tmp/staging') }}/hana"
+    remote_hana_client_target: "{{ remote_hana_staging_dir | default('/usr/sap/tmp/staging') }}/hana_client"
+    remote_hostagent_target: "{{ remote_hostagent_staging_dir | default('/usr/sap/tmp/staging') }}/hostagent"
+
+    # Credentials (for download_basket method)
+    sap_suser: "{{ lookup('env', 'SAP_OPERATIONS_DOWNLOAD_USERNAME') | default('') }}"
+    sap_password: "{{ lookup('env', 'SAP_OPERATIONS_DOWNLOAD_PASSWORD') | default('') }}"
+
+  tasks:
+    # ------------------------------------------------------------------------
+    # 0. PREPARE FILES ON CONTROLLER (Run Once)
+    # ------------------------------------------------------------------------
+    - name: "Controller Preparation Block"
+      run_once: true
+      delegate_to: localhost
+      become: false
+      block:
+        - name: "Ensure controller staging base directories exist"
+          file:
+            path: "{{ item }}"
+            state: directory
+            mode: '0755'
+            owner: aktansible
+            group: aktansible
+          loop:
+            - "{{ base_staging_dir }}"
+            - "{{ base_staging_dir }}/prepared"
+            - "{{ source_dir }}"
+
+        # --- CLEANUP OLD STAGING DIRECTORIES ---
+        - name: "Find old staging directories (>{{ staging_cleanup_age_days | default(7) }} days)"
+          find:
+            paths: "{{ base_staging_dir }}/prepared"
+            recurse: false
+            patterns: "*_*_*"
+            file_type: directory
+            age: "{{ staging_cleanup_age_days | default(7) }}d"
+          register: old_staging_dirs
+
+        - name: "Remove old staging directories"
+          file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ old_staging_dirs.files }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          when: old_staging_dirs.matched > 0
+
+        # --- CLEANUP OLD REPORT FILES ---
+        - name: "Find old report files (>{{ staging_cleanup_age_days | default(7) }} days)"
+          find:
+            paths: "{{ base_staging_dir }}/reports"
+            recurse: false
+            patterns: "staging_*.md,staging_*.html"
+            age: "{{ staging_cleanup_age_days | default(7) }}d"
+          register: old_report_files
+          ignore_errors: true
+
+        - name: "Remove old report files"
+          file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ old_report_files.files | default([]) }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          when: old_report_files.matched | default(0) > 0
+
+        - name: "Display Staging Configuration"
+          debug:
+            msg:
+              - "Run ID:         {{ staging_run_id }}"
+              - "Method:         {{ staging_method }}"
+              - "Source:         {{ source_dir }}"
+              - "Prepared Base:  {{ prepared_dir }}"
+              - "Components:     Kernel={{ stage_kernel_selected }} | HANA={{ stage_hana_selected }} | Hostagent={{ stage_hostagent_selected }}"
+              - "Filter Active:  {{ component_filter_active }}"
+
+        - name: "Check disk space on controller"
+          shell: "df -h / /home 2>/dev/null | tail -n +2"
+          register: disk_space_check
+          changed_when: false
+
+        - name: "Display disk space"
+          debug:
+            var: disk_space_check.stdout_lines
+
+        # --- AUTO DOWNLOAD ---
+        - name: "Auto Method - SAP Download"
+          when: staging_method == 'download_basket'
+          block:
+            - name: "Clean source directory before download"
+              shell: "rm -f {{ source_dir }}/*.SAR {{ source_dir }}/*.sar {{ source_dir }}/*.EXE {{ source_dir }}/*.exe 2>/dev/null || true"
+              changed_when: false
+
+            - name: "Verify Credentials"
+              fail:
+                msg: "SAP S-User or Password missing!"
+              when: sap_suser == "" or sap_password == ""
+
+            - name: "Ensure source directory exists"
+              file:
+                path: "{{ source_dir }}"
+                state: directory
+                mode: '0755'
+                owner: aktansible
+                group: aktansible
+
+            - name: "Download Basket"
+              include_role:
+                name: downloadbasket_custom
+                tasks_from: main
+              vars:
+                downloadbasket_destination: "{{ source_dir }}"
+                downloadbasket_username: "{{ sap_suser }}"
+                downloadbasket_password: "{{ sap_password }}"
+                downloadbasket_download_item_types: ["C"]
+
+            # Remove unwanted files immediately after download when filter is active.
+            # This avoids extracting/distributing components that were not selected.
+            - name: "Remove unselected files from download"
+              shell: |
+                cd {{ source_dir }}
+                {% if not stage_kernel_selected %}
+                rm -f SAPEXE*.SAR SAPEXEDB*.SAR dw_*.SAR sapnwrfc*.SAR R3trans*.SAR tp_*.SAR 2>/dev/null
+                {% endif %}
+                {% if not stage_hana_selected %}
+                rm -f IMDB_SERVER*.SAR IMDB_CLIENT*.SAR 2>/dev/null
+                {% endif %}
+                {% if not stage_hostagent_selected %}
+                rm -f SAPHOSTAGENT*.SAR 2>/dev/null
+                {% endif %}
+                echo "Remaining files after filter:" && ls -1 *.SAR *.EXE 2>/dev/null || echo "(none)"
+              register: download_filter_cleanup
+              changed_when: false
+              when: component_filter_active | bool
+
+            - name: "Show post-download filter result"
+              debug:
+                var: download_filter_cleanup.stdout_lines
+              when: download_filter_cleanup is defined and download_filter_cleanup is not skipped
+
+        # --- VALIDATE SOURCE ---
+        - name: "Verify source directory exists"
+          stat:
+            path: "{{ source_dir }}"
+          register: source_dir_stat
+
+        - name: "Fail if source directory missing"
+          fail:
+            msg: "Source directory '{{ source_dir }}' does not exist!"
+          when: not source_dir_stat.stat.exists
+
+        # --- FILE CATEGORIZATION (directly from source/) ---
+        - name: "Find all SAR/EXE files in source"
+          find:
+            paths: "{{ source_dir }}"
+            patterns: "*.SAR,*.sar,*.EXE,*.exe"
+          register: all_source_files
+
+        - name: "Fail if no files found"
+          fail:
+            msg: "No SAR/EXE files found in {{ source_dir }}!"
+          when: all_source_files.matched == 0
+
+        # --- COMPONENT FILTER (checkbox-based) ---
+        # Each component can be toggled via pipeline boolean parameters.
+        # All true (default) = stage everything. SAPCAR is always included.
+        - name: "Determine if component filter is active"
+          set_fact:
+            _filter_active: "{{ component_filter_active }}"
+
+        - name: "Apply component filter"
+          set_fact:
+            all_source_files_original: "{{ all_source_files }}"
+            all_source_files: >-
+              {{ all_source_files | combine({
+                'files': all_source_files.files | selectattr('path', 'match',
+                  '.*/(SAPCAR'
+                  ~ ('|SAPEXE|SAPEXEDB|dw_|sapnwrfc|R3trans|tp_' if stage_kernel_selected else '')
+                  ~ ('|IMDB_SERVER|IMDB_CLIENT' if stage_hana_selected else '')
+                  ~ ('|SAPHOSTAGENT' if stage_hostagent_selected else '')
+                  ~ ').*'
+                ) | list,
+                'matched': all_source_files.files | selectattr('path', 'match',
+                  '.*/(SAPCAR'
+                  ~ ('|SAPEXE|SAPEXEDB|dw_|sapnwrfc|R3trans|tp_' if stage_kernel_selected else '')
+                  ~ ('|IMDB_SERVER|IMDB_CLIENT' if stage_hana_selected else '')
+                  ~ ('|SAPHOSTAGENT' if stage_hostagent_selected else '')
+                  ~ ').*'
+                ) | list | length
+              }) }}
+          when: component_filter_active | bool
+
+        - name: "Display component filter"
+          debug:
+            msg:
+              - "Kernel: {{ stage_kernel_selected }} | HANA: {{ stage_hana_selected }} | Hostagent: {{ stage_hostagent_selected }}"
+              - "Files before filter: {{ all_source_files_original.matched }}"
+              - "Files after filter: {{ all_source_files.matched }}"
+              - "Selected files: {{ all_source_files.files | map(attribute='path') | map('basename') | list }}"
+          when: component_filter_active | bool
+
+        - name: "Fail if no components selected"
+          fail:
+            msg: >-
+              No SAR/EXE files match selected components!
+              Kernel={{ stage_kernel_selected }}, HANA={{ stage_hana_selected }},
+              Hostagent={{ stage_hostagent_selected }}.
+              Available files: {{ all_source_files_original.files | map(attribute='path') | map('basename') | list }}
+          when:
+            - component_filter_active | bool
+            - (all_source_files.files | rejectattr('path', 'match', '.*/SAPCAR.*') | list | length == 0)
+
+        - name: "Categorize files by type"
+          set_fact:
+            sapcar_files: "{{ all_source_files.files | selectattr('path', 'match', '.*/SAPCAR.*') | list }}"
+            kernel_sars: "{{ all_source_files.files | selectattr('path', 'match', '.*/(SAPEXE|SAPEXEDB|dw_|sapnwrfc|R3trans|tp_).*') | list }}"
+            hana_server_sars: "{{ all_source_files.files | selectattr('path', 'match', '.*/IMDB_SERVER.*') | list }}"
+            hana_client_sars: "{{ all_source_files.files | selectattr('path', 'match', '.*/IMDB_CLIENT.*') | list }}"
+            hana_sars: "{{ all_source_files.files | selectattr('path', 'match', '.*/IMDB_(SERVER|CLIENT).*') | list }}"
+            hostagent_sars: "{{ all_source_files.files | selectattr('path', 'match', '.*/SAPHOSTAGENT.*') | list }}"
+
+        - name: "Display file categorization"
+          debug:
+            msg:
+              - "Source:    {{ source_dir }}"
+              - "SAPCAR:    {{ sapcar_files | map(attribute='path') | map('basename') | list }}"
+              - "Kernel:    {{ kernel_sars | map(attribute='path') | map('basename') | list }}"
+              - "HANA:      {{ hana_sars | map(attribute='path') | map('basename') | list }}"
+              - "Hostagent: {{ hostagent_sars | map(attribute='path') | map('basename') | list }}"
+
+        - name: "Fail when selected component archives are missing"
+          assert:
+            that:
+              - not stage_kernel_selected or (kernel_sars | length > 0)
+              - not stage_hana_selected or (hana_sars | length > 0)
+              - not stage_hostagent_selected or (hostagent_sars | length > 0)
+            fail_msg: >-
+              Selected staging component archive is missing.
+              Kernel selected={{ stage_kernel_selected }} found={{ kernel_sars | length }};
+              HANA selected={{ stage_hana_selected }} found={{ hana_sars | length }};
+              Hostagent selected={{ stage_hostagent_selected }} found={{ hostagent_sars | length }}.
+
+        # --- SAPCAR VALIDATION ---
+        - name: "Find SAPCAR executable"
+          set_fact:
+            sapcar_path: "{{ sapcar_files[0].path }}"
+          when: sapcar_files | length > 0
+
+        - name: "Fail if SAPCAR missing"
+          fail:
+            msg: "No SAPCAR executable found in {{ source_dir }}. Add a SAPCAR*.EXE file."
+          when: sapcar_files | length == 0
+
+        - name: "Verify SAPCAR executable works"
+          command:
+            argv:
+              - "{{ sapcar_path }}"
+              - -version
+          register: sapcar_version_check
+          changed_when: false
+
+        - name: "Collect staging package checksums"
+          stat:
+            path: "{{ item.path }}"
+            checksum_algorithm: sha256
+          loop: "{{ all_source_files.files | rejectattr('path', 'match', '.*/SAPCAR.*') | list }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          register: staging_package_stats
+
+        - name: "Build download basket checksum map"
+          set_fact:
+            downloadbasket_expected_checksums: >-
+              {%- set checksum_map = {} -%}
+              {%- for result in downloadbasket_files_info.results | default([]) -%}
+              {%-   set filename = result.me_file_info.FileName | default('') -%}
+              {%-   if filename | length > 0 -%}
+              {%-     set _ = checksum_map.update({filename: result.me_file_info.Checksum | default('')}) -%}
+              {%-   endif -%}
+              {%- endfor -%}
+              {{ checksum_map }}
+          when: staging_method == 'download_basket'
+
+        - name: "Build staging package candidate list"
+          set_fact:
+            staging_package_candidates: >-
+              {%- set candidates = [] -%}
+              {%- for file in kernel_sars -%}
+              {%-   set _ = candidates.append({'path': file.path, 'filename': (file.path | basename), 'package_type': 'kernel', 'target_path': remote_kernel_target}) -%}
+              {%- endfor -%}
+              {%- for file in hana_server_sars -%}
+              {%-   set _ = candidates.append({'path': file.path, 'filename': (file.path | basename), 'package_type': 'hana', 'target_path': remote_hana_target}) -%}
+              {%- endfor -%}
+              {%- for file in hana_client_sars -%}
+              {%-   set _ = candidates.append({'path': file.path, 'filename': (file.path | basename), 'package_type': 'hana', 'target_path': remote_hana_client_target}) -%}
+              {%- endfor -%}
+              {%- for file in hostagent_sars -%}
+              {%-   set _ = candidates.append({'path': file.path, 'filename': (file.path | basename), 'package_type': 'hostagent', 'target_path': remote_hostagent_target}) -%}
+              {%- endfor -%}
+              {{ candidates }}
+
+        - name: "Verify staging package archive integrity"
+          command:
+            argv:
+              - "{{ sapcar_path }}"
+              - -tvf
+              - "{{ item.path }}"
+          loop: "{{ staging_package_candidates }}"
+          loop_control:
+            label: "{{ item.filename }}"
+          register: staging_archive_validation
+          changed_when: false
+          when: staging_package_candidates | length > 0
+
+        - name: "Build staging package metadata"
+          set_fact:
+            staging_package_metadata: >-
+              {%- set checksum_map = {} -%}
+              {%- for stat_result in staging_package_stats.results | default([]) -%}
+              {%-   if stat_result.stat is defined and stat_result.stat.path is defined -%}
+              {%-     set _ = checksum_map.update({stat_result.stat.path: stat_result.stat.checksum | default('')}) -%}
+              {%-   endif -%}
+              {%- endfor -%}
+              {%- set metadata = [] -%}
+              {%- for archive_result in staging_archive_validation.results | default([]) -%}
+              {%-   set candidate = archive_result.item -%}
+              {%-   set actual_sha256 = checksum_map.get(candidate.path, '') -%}
+              {%-   set expected_sha256 = (downloadbasket_expected_checksums | default({})).get(candidate.filename, '') -%}
+              {%-   set checksum_ok = (expected_sha256 | length == 0) or (expected_sha256 == actual_sha256) -%}
+              {%-   set integrity_verified = (archive_result.rc | default(1) == 0) and checksum_ok -%}
+              {%-   set integrity_method = 'sapcar_list_and_sha256' if (expected_sha256 | length > 0) else 'sapcar_list' -%}
+              {%-   set _ = metadata.append({
+                      'package_type': candidate.package_type,
+                      'source_path': candidate.path,
+                      'target_path': candidate.target_path,
+                      'integrity_verified': integrity_verified,
+                      'integrity_method': integrity_method,
+                      'expected_sha256': expected_sha256,
+                      'actual_sha256': actual_sha256,
+                      'staging_timestamp': lookup('ansible.builtin.pipe', 'date --iso-8601=seconds')
+                    }) -%}
+              {%- endfor -%}
+              {{ metadata }}
+
+        - name: "Validate staging package metadata"
+          assert:
+            that:
+              - item.package_type in staging_package_types_allowed
+              - item.source_path | length > 0
+              - item.target_path | length > 0
+              - item.integrity_verified | bool
+            fail_msg: >-
+              Invalid staging package metadata for {{ item.source_path | basename }}:
+              package_type={{ item.package_type }},
+              integrity_method={{ item.integrity_method | default('unknown') }},
+              integrity_verified={{ item.integrity_verified | default(false) }},
+              expected_sha256={{ item.expected_sha256 | default('n/a') }},
+              actual_sha256={{ item.actual_sha256 | default('n/a') }}
+          loop: "{{ staging_package_metadata | default([]) }}"
+          loop_control:
+            label: "{{ item.source_path | basename }}"
+          when: staging_package_metadata is defined
+
+        # --- CLEAN OLD PREPARED DATA ---
+        - name: "Remove old prepared directories (free disk space)"
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop: >-
+            {{
+              [kernel_extract_dir]
+              + ([hana_extract_dir] if (hana_server_sars | length > 0) else [])
+              + ([hana_client_extract_dir] if (hana_client_sars | length > 0) else [])
+              + [hostagent_dir]
+            }}
+
+        # --- CLEAN LEGACY STAGING DIRECTORY ---
+        - name: "Check for legacy staging directory"
+          stat:
+            path: "/home/aktansible/sap_kernel_update/downloads"
+          register: legacy_staging_dir
+
+        - name: "Remove legacy staging directory"
+          file:
+            path: "/home/aktansible/sap_kernel_update"
+            state: absent
+          when: legacy_staging_dir.stat.exists | default(false)
+
+        # --- CREATE PREPARED DIRECTORY STRUCTURE ---
+        - name: "Create prepared directory structure"
+          file:
+            path: "{{ item }}"
+            state: directory
+            mode: '0755'
+            owner: aktansible
+            group: aktansible
+          loop: >-
+            {{
+              [kernel_extract_dir]
+              + ([hana_extract_dir] if (hana_server_sars | length > 0) else [])
+              + ([hana_client_extract_dir] if (hana_client_sars | length > 0) else [])
+              + [hostagent_dir]
+            }}
+
+        - name: "Persist staging package metadata"
+          copy:
+            dest: "{{ prepared_dir }}/staging_package_metadata.yml"
+            content: >-
+              {{
+                {
+                  'staging_customer': staging_customer | default('UNKNOWN'),
+                  'staging_environment': staging_environment | default('UNKNOWN'),
+                  'staging_run_id': staging_run_id,
+                  'staging_method': staging_method,
+                  'packages': staging_package_metadata | default([])
+                } | to_nice_yaml(indent=2)
+              }}
+            mode: '0644'
+            owner: aktansible
+            group: aktansible
+
+        # --- KERNEL EXTRACTION ---
+        - name: "Extract Kernel SAR files"
+          command:
+            cmd: "{{ sapcar_path }} -xvf {{ item.path }} -R {{ kernel_extract_dir }}"
+          loop: "{{ kernel_sars }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          when: kernel_sars | length > 0
+
+        # --- HANA SERVER EXTRACTION ---
+        - name: "Extract HANA Server SAR files"
+          command:
+            cmd: "{{ sapcar_path }} -xvf {{ item.path }} -R {{ hana_extract_dir }}"
+          loop: "{{ hana_server_sars }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          when: hana_server_sars | length > 0
+
+        - name: "Skip HANA Server extraction (no IMDB_SERVER SARs)"
+          debug:
+            msg: "HANA Server SAR extraction skipped - no IMDB_SERVER files found in source"
+          when: hana_server_sars | length == 0
+
+        # --- HANA CLIENT EXTRACTION ---
+        - name: "Extract HANA Client SAR files"
+          command:
+            cmd: "{{ sapcar_path }} -xvf {{ item.path }} -R {{ hana_client_extract_dir }}"
+          loop: "{{ hana_client_sars }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          when: hana_client_sars | length > 0
+
+        - name: "Skip HANA Client extraction (no IMDB_CLIENT SARs)"
+          debug:
+            msg: "HANA Client SAR extraction skipped - no IMDB_CLIENT files found in source"
+          when: hana_client_sars | length == 0
+
+        # --- HOSTAGENT (copy only, role extracts itself) ---
+        - name: "Copy Hostagent SAR files to prepared"
+          copy:
+            src: "{{ item.path }}"
+            dest: "{{ hostagent_dir }}/"
+            mode: '0755'
+          loop: "{{ hostagent_sars }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          when: hostagent_sars | length > 0
+
+        - name: "Initialize extraction summary counters"
+          set_fact:
+            kernel_files_count:
+              matched: 0
+            hana_files_count:
+              matched: 0
+            hana_client_files_count:
+              matched: 0
+            hostagent_files_count:
+              matched: 0
+
+        # --- EXTRACTION SUMMARY ---
+        - name: "Count extracted kernel files"
+          find:
+            paths: "{{ kernel_extract_dir }}"
+            recurse: false
+          register: kernel_files_count
+          when: kernel_sars | length > 0
+
+        - name: "Count extracted HANA Server files"
+          find:
+            paths: "{{ hana_extract_dir }}"
+            recurse: true
+          register: hana_files_count
+          when: hana_server_sars | length > 0
+
+        - name: "Count extracted HANA Client files"
+          find:
+            paths: "{{ hana_client_extract_dir }}"
+            recurse: true
+          register: hana_client_files_count
+          when: hana_client_sars | length > 0
+
+        - name: "Count hostagent files"
+          find:
+            paths: "{{ hostagent_dir }}"
+            patterns: "*.SAR,*.sar"
+          register: hostagent_files_count
+          when: hostagent_sars | length > 0
+
+        - name: "Normalize extraction counters for skipped components"
+          set_fact:
+            kernel_files_count: "{{ kernel_files_count if (kernel_files_count.matched is defined) else {'matched': 0} }}"
+            hana_files_count: "{{ hana_files_count if (hana_files_count.matched is defined) else {'matched': 0} }}"
+            hana_client_files_count: "{{ hana_client_files_count if (hana_client_files_count.matched is defined) else {'matched': 0} }}"
+            hostagent_files_count: "{{ hostagent_files_count if (hostagent_files_count.matched is defined) else {'matched': 0} }}"
+
+        # --- CLEANUP SOURCE FILES AFTER STAGING ---
+        # Keep prepared/ for potential re-use, but clean source/ to free space
+        # When filter is active: only remove filtered files, keep SAPCAR and unfiltered files
+        - name: "Remove source files after successful staging"
+          file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ all_source_files.files | rejectattr('path', 'match', '.*/SAPCAR.*') | list if (component_filter_active | bool) else all_source_files.files }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          when: all_source_files.matched > 0
+
+    # ------------------------------------------------------------------------
+    # 2. DETECT SAP SYSTEM TYPES
+    # ------------------------------------------------------------------------
+    - name: "Detect SAP Instances"
+      sap.sap_operations.host_info:
+      register: sap_host_info
+      failed_when: false
+
+    - name: "Classify Host Type"
+      set_fact:
+        is_app_server: "{{ sap_host_info.instances | default([]) | selectattr('ProcessList', 'defined') | map(attribute='ProcessList') | flatten | selectattr('name', 'search', 'disp\\\\+work|msg_server') | list | length > 0 }}"
+        is_hana_server: "{{ sap_host_info.databases | default([]) | length > 0 }}"
+        sap_sid: "{{ sap_host_info.instances[0].mSid | default('') }}"
+      when: sap_host_info.instances is defined or sap_host_info.databases is defined
+
+    - name: "Display Host Classification"
+      debug:
+        msg: "Host: {{ inventory_hostname }} | APP: {{ is_app_server | default(false) }} | HANA: {{ is_hana_server | default(false) }} | SID: {{ sap_sid | default('N/A') }}"
+
+    - name: "Remove kernel staging when kernel was not selected"
+      become: true
+      file:
+        path: "{{ remote_kernel_target }}"
+        state: absent
+      when:
+        - is_app_server | default(false)
+        - not stage_kernel_selected or (kernel_sars | length == 0)
+
+    - name: "Remove HANA staging when HANA was not selected"
+      become: true
+      file:
+        path: "{{ remote_hana_target }}"
+        state: absent
+      when:
+        - is_hana_server | default(false)
+        - not stage_hana_selected or (hana_server_sars | length == 0)
+
+    - name: "Remove HANA client staging when HANA was not selected"
+      become: true
+      file:
+        path: "{{ remote_hana_client_target }}"
+        state: absent
+      when:
+        - is_app_server | default(false)
+        - not stage_hana_selected or (hana_client_sars | length == 0)
+
+    - name: "Remove hostagent staging when hostagent was not selected"
+      become: true
+      file:
+        path: "{{ remote_hostagent_target }}"
+        state: absent
+      when:
+        - is_app_server | default(false)
+        - not stage_hostagent_selected or (hostagent_sars | length == 0)
+
+    - name: "Remove hostagent staging on HANA servers when hostagent was not selected"
+      become: true
+      file:
+        path: "{{ remote_hostagent_target }}"
+        state: absent
+      when:
+        - is_hana_server | default(false)
+        - not stage_hostagent_selected or (hostagent_sars | length == 0)
+
+    # ------------------------------------------------------------------------
+    # 3. DISTRIBUTE KERNEL FILES TO APP SERVERS
+    # ------------------------------------------------------------------------
+    - name: "Distribute Kernel to App Servers"
+      become: true
+      block:
+        - name: "Check kernel files available"
+          find:
+            paths: "{{ kernel_extract_dir }}"
+            recurse: false
+          register: kernel_upload_files
+          delegate_to: localhost
+          run_once: true
+          become: false
+
+        - name: "Reset remote kernel directory"
+          file:
+            path: "{{ remote_kernel_target }}"
+            state: absent
+
+        - name: "Create remote kernel directory"
+          file:
+            path: "{{ remote_kernel_target }}"
+            state: directory
+            mode: '0755'
+            owner: "{{ sap_sid | lower }}adm"
+            group: sapsys
+
+        - name: "Upload Kernel files"
+          copy:
+            src: "{{ kernel_extract_dir }}/"
+            dest: "{{ remote_kernel_target }}/"
+            owner: "{{ sap_sid | lower }}adm"
+            group: sapsys
+            mode: '0755'
+            force: true
+
+        - name: "Verify Kernel staging"
+          shell: "ls -la {{ remote_kernel_target }} | head -20"
+          register: kernel_staging_ls
+
+        - name: "Show Kernel Staging Result"
+          debug:
+            var: kernel_staging_ls.stdout_lines
+      when:
+        - is_app_server | default(false)
+        - kernel_sars | length > 0
+
+    # ------------------------------------------------------------------------
+    # 4. DISTRIBUTE HANA FILES TO HANA SERVERS
+    # ------------------------------------------------------------------------
+    - name: "Skip HANA distribution (no HANA SARs found)"
+      debug:
+        msg: "HANA Server distribution skipped - no IMDB_SERVER files in selection"
+      when: hana_server_sars | length == 0
+
+    - name: "Distribute HANA Medium to HANA Servers"
+      become: true
+      block:
+        - name: "Check HANA files available"
+          find:
+            paths: "{{ hana_extract_dir }}"
+            recurse: true
+          register: hana_upload_files
+          delegate_to: localhost
+          become: false
+
+        - name: "Reset remote HANA directory"
+          file:
+            path: "{{ remote_hana_target }}"
+            state: absent
+          when: hana_upload_files.matched > 0
+
+        - name: "Create remote HANA directory"
+          file:
+            path: "{{ remote_hana_target }}"
+            state: directory
+            mode: '0755'
+            owner: "{{ sap_sid | lower }}adm"
+            group: sapsys
+          when: hana_upload_files.matched > 0
+
+        - name: "Upload HANA medium"
+          copy:
+            src: "{{ hana_extract_dir }}/"
+            dest: "{{ remote_hana_target }}/"
+            owner: "{{ sap_sid | lower }}adm"
+            group: sapsys
+            mode: '0755'
+            force: true
+          when: hana_upload_files.matched > 0
+
+        - name: "Verify HANA staging"
+          shell: "ls -laR {{ remote_hana_target }} | head -30"
+          register: hana_staging_ls
+          when: hana_upload_files.matched > 0
+
+        - name: "Show HANA Staging Result"
+          debug:
+            var: hana_staging_ls.stdout_lines
+          when: hana_upload_files.matched | default(0) > 0
+      when:
+        - is_hana_server | default(false)
+        - hana_server_sars | length > 0
+
+    # ------------------------------------------------------------------------
+    # 4b. DISTRIBUTE HANA CLIENT TO APP SERVERS
+    # ------------------------------------------------------------------------
+    - name: "Distribute HANA Client to App Servers"
+      become: true
+      block:
+        - name: "Check HANA Client files available"
+          find:
+            paths: "{{ hana_client_extract_dir }}"
+            recurse: true
+          register: hana_client_upload_files
+          delegate_to: localhost
+          become: false
+
+        - name: "Reset remote HANA Client directory"
+          file:
+            path: "{{ remote_hana_client_target }}"
+            state: absent
+          when: hana_client_upload_files.matched > 0
+
+        - name: "Create remote HANA Client directory"
+          file:
+            path: "{{ remote_hana_client_target }}"
+            state: directory
+            mode: '0755'
+            owner: "{{ sap_sid | lower }}adm"
+            group: sapsys
+          when: hana_client_upload_files.matched > 0
+
+        - name: "Upload HANA Client medium"
+          copy:
+            src: "{{ hana_client_extract_dir }}/"
+            dest: "{{ remote_hana_client_target }}/"
+            owner: "{{ sap_sid | lower }}adm"
+            group: sapsys
+            mode: '0755'
+            force: true
+          when: hana_client_upload_files.matched > 0
+
+        - name: "Verify HANA Client staging"
+          shell: "ls -laR {{ remote_hana_client_target }} | head -20"
+          register: hana_client_staging_ls
+          when: hana_client_upload_files.matched > 0
+
+        - name: "Show HANA Client Staging Result"
+          debug:
+            var: hana_client_staging_ls.stdout_lines
+          when: hana_client_upload_files.matched | default(0) > 0
+      when:
+        - is_app_server | default(false)
+        - hana_client_sars | length > 0
+
+    # ------------------------------------------------------------------------
+    # 5. DISTRIBUTE HOSTAGENT SAR TO HANA SERVERS
+    # ------------------------------------------------------------------------
+    - name: "Distribute Hostagent SAR to HANA Servers"
+      become: true
+      block:
+        - name: "Check Hostagent files available"
+          find:
+            paths: "{{ hostagent_dir }}"
+            patterns: "*.SAR,*.sar"
+          register: hostagent_upload_files
+          delegate_to: localhost
+          become: false
+
+        - name: "Reset remote Hostagent directory"
+          file:
+            path: "{{ remote_hostagent_target }}"
+            state: absent
+          when: hostagent_upload_files.matched > 0
+
+        - name: "Create remote Hostagent directory"
+          file:
+            path: "{{ remote_hostagent_target }}"
+            state: directory
+            mode: '0755'
+            owner: root
+            group: sapsys
+          when: hostagent_upload_files.matched > 0
+
+        - name: "Upload Hostagent SAR"
+          copy:
+            src: "{{ hostagent_dir }}/"
+            dest: "{{ remote_hostagent_target }}/"
+            owner: root
+            group: sapsys
+            mode: '0755'
+            force: true
+          when: hostagent_upload_files.matched > 0
+
+        - name: "Verify Hostagent staging"
+          shell: "ls -la {{ remote_hostagent_target }}"
+          register: hostagent_staging_ls
+          when: hostagent_upload_files.matched > 0
+
+        - name: "Show Hostagent Staging Result"
+          debug:
+            var: hostagent_staging_ls.stdout_lines
+          when: hostagent_upload_files.matched | default(0) > 0
+      when:
+        - is_hana_server | default(false)
+        - stage_hostagent_selected | bool
+        - hostagent_sars | length > 0
+
+    # ------------------------------------------------------------------------
+    # 6. REPORTING
+    # ------------------------------------------------------------------------
+    - name: "Set staging report basename"
+      set_fact:
+        staging_report_basename: "staging_{{ staging_customer | default('UNKNOWN') }}_{{ staging_environment | default('UNKNOWN') }}_{{ staging_run_id }}"
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: "Create reports directory"
+      file:
+        path: "{{ base_staging_dir }}/reports"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: "Generate Staging Report"
+      template:
+        src: "{{ playbook_dir }}/../templates/staging_report.j2"
+        dest: "{{ base_staging_dir }}/reports/{{ staging_report_basename }}.md"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: "Convert Staging Report to HTML"
+      shell: |
+        python3 "{{ playbook_dir }}/../scripts/md_to_html_email.py" \
+          "{{ base_staging_dir }}/reports/{{ staging_report_basename }}.md" \
+          "{{ base_staging_dir }}/reports/{{ staging_report_basename }}.html" \
+          --title "SAP Staging Report - {{ staging_customer | default('UNKNOWN') }} {{ staging_environment | default('UNKNOWN') }}"
+      delegate_to: localhost
+      run_once: true
+      become: false
+      when: email_recipient | default('none') != 'none'
+
+    - name: "Send Staging Report Email"
+      include_role:
+        name: send_email
+      vars:
+        email_recipient: "{{ email_recipient }}"
+        email_subject: "SAP Staging Report - {{ staging_customer | default('UNKNOWN') }} {{ staging_environment | default('UNKNOWN') }} - Run {{ staging_run_id }}"
+        email_html_file: "{{ base_staging_dir }}/reports/{{ staging_report_basename }}.html"
+      when: email_recipient | default('none') != 'none'
+      run_once: true

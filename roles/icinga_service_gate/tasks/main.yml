@@ -1,0 +1,103 @@
+# =============================================================================
+# Role: icinga_service_gate - Icinga Health Gate with Polling
+# =============================================================================
+# Polls Icinga every gate_poll_interval seconds until ALL monitored services
+# are healthy, or until gate_max_wait_seconds is reached (timeout).
+#
+# The gate is used as a quality gate: after starting SAP systems, the pipeline
+# waits until Icinga confirms all services are OK before proceeding.
+#
+# Exclusion mechanism:
+#   - exclude_services: list of exact service names to ignore (e.g. "uptime")
+#   - exclude_service_prefixes: list of prefixes to ignore (e.g. "sap_")
+#   Both are combined into a single regex alternation pattern for filtering.
+#
+# Icinga service states: 0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN
+# The gate only waits for states 2 (CRITICAL) and 3 (UNKNOWN) to clear.
+# =============================================================================
+
+# Build a combined regex from exclude_services (exact) + exclude_service_prefixes.
+# Input normalization: exclude_services can be a list or a comma-separated
+# string (from pipeline parameters) — normalize to list first, then join
+# with exclude_service_prefixes into a regex alternation: ^(pattern1|pattern2|...)
+- name: "Build exclusion pattern"
+  set_fact:
+    _gate_exclude_pattern: >-
+      ^({{ (
+        _normalized_excludes
+        + (exclude_service_prefixes | default([]))
+      ) | join('|') }})
+  vars:
+    _normalized_excludes: "{{ exclude_services | default([]) if (exclude_services is defined and exclude_services is not string) else ((exclude_services | default('')) | string).split(',') | map('trim') | select() | list }}"
+
+# Poll Icinga API until healthy or timeout.
+# The `until:` clause checks two conditions:
+#   1. HTTP 200 response (API reachable)
+#   2. Zero CRITICAL/UNKNOWN services remain (after filtering out excluded ones)
+# Filter: state 'in [2, 3]' selects CRITICAL and UNKNOWN services.
+# The `rejectattr` removes excluded services via the regex pattern built above.
+# Retries = max_wait / poll_interval (e.g. 1200s / 120s = 10 retries).
+- name: "Poll Icinga until healthy (max {{ gate_max_wait_seconds | default(1200) }}s)"
+  uri:
+    url: "{{ icinga_url }}/v1/objects/services"
+    method: POST
+    headers:
+      Accept: "application/json"
+      X-HTTP-Method-Override: "GET"
+    body_format: json
+    body:
+      filter: "host.name==\"{{ gate_target_host | default(inventory_hostname) }}\" || host.address==\"{{ gate_target_address | default(ansible_host | default(inventory_hostname)) }}\""
+      attrs: ["last_check_result", "display_name"]
+    user: "{{ icinga_user }}"
+    password: "{{ icinga_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    timeout: 30
+    status_code: [200]
+  register: _icinga_poll_result
+  delegate_to: localhost
+  until: >-
+    (_icinga_poll_result.status | default(0)) == 200
+    and
+    (_icinga_poll_result.json.results | default([])
+     | selectattr('attrs.last_check_result.state', 'defined')
+     | selectattr('attrs.last_check_result.state', 'in', [2, 3])
+     | rejectattr('attrs.display_name', 'match', _gate_exclude_pattern)
+     | list | length) == 0
+  retries: "{{ ((gate_max_wait_seconds | default(1200)) | int / (gate_poll_interval | default(120)) | int) | int }}"
+  delay: "{{ gate_poll_interval | default(120) }}"
+  failed_when: false
+
+# After polling, do a final precise check via icinga_service_check role
+# to get the definitive list of critical services for gate decision.
+- name: "Query Icinga service status"
+  include_role:
+    name: icinga_service_check
+  vars:
+    target_hostname: "{{ gate_target_host | default(inventory_hostname) }}"
+
+# Normalize the result type: icinga_service_check may return a YAML string
+# (when Ansible serializes a list as a string) instead of an actual list.
+# This ensures downstream consumers always get a proper list object.
+- name: "Normalize critical services list"
+  set_fact:
+    _icinga_crit_list: >-
+      {%- set raw_val = icinga_critical_services | default([], true) -%}
+      {%- if raw_val is string -%}
+        {{ raw_val | from_yaml }}
+      {%- else -%}
+        {{ raw_val }}
+      {%- endif -%}
+
+# Gate decision: Fail the play if critical services remain after polling.
+# gate_fail_on_critical defaults to true; set to false during PreCheck stage
+# for a non-blocking health check (check-only mode).
+- name: "Health Gate: Fail on critical services"
+  fail:
+    msg: |
+      Health gate FAILED for {{ gate_target_host | default(inventory_hostname) }}.
+      Found {{ (_icinga_crit_list | default([])) | length }} critical service(s):
+      {{ (_icinga_crit_list | default([])) | map(attribute='attrs.display_name') | list | to_nice_json }}
+  when:
+    - gate_fail_on_critical | default(true) | bool
+    - (_icinga_crit_list | default([])) | length > 0

@@ -1,0 +1,33 @@
+---
+# =============================================================================
+# Role: icinga_service_gate - Generic Icinga-based Health Gate
+# =============================================================================
+
+# Shared maintenance switches keep the operator-facing toggle registry explicit.
+do_kernel: false  # Default false; do not process kernel-specific maintenance unless selected.
+do_hana: false  # Default false; do not process HANA-specific maintenance unless selected.
+do_os_patch: false  # Default false; do not trigger OS patching behavior unless selected.
+skip_icinga: false  # Default false; true bypasses Icinga checks and downtime handling.
+do_root_keys: false  # Default false; true enables HANA root key handling where supported.
+
+# --- Fixed Pause Mode (legacy) ---
+# pause_duration > 0: wait this many seconds, then check once
+# 0 = no pause (immediate check)
+pause_duration: 0
+
+# --- Poll Mode (recommended for post-validation) ---
+# Polls Icinga every gate_poll_interval seconds until all services are healthy
+# or gate_max_wait_seconds is reached. Replaces the fixed pause.
+gate_poll_mode: false
+gate_poll_interval: 120       # seconds between polls (default: 2 min)
+gate_max_wait_seconds: 1200   # max total wait (default: 20 min)
+
+# Failure behavior on critical services
+# If true: fail task execution when critical services found
+# If false: only report, do not fail
+gate_fail_on_critical: true
+
+# Icinga connection
+icinga_url: "https://icinga.example.invalid:5665"
+icinga_user: ""
+icinga_password: ""

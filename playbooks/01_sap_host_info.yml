@@ -1,0 +1,174 @@
+- name: "SAP Host Information Collection"
+  hosts: all
+  gather_facts: true
+  become: true
+  vars:
+    host_info_kernel_instance_markers:
+      - disp+work
+      - msg_server
+      - enqreplserver
+      - sapwebdisp
+  tasks:
+    # ========================================
+    # 1. Set Report Timestamp
+    # ========================================
+    - name: "Set Report Timestamp"
+      set_fact:
+        report_time: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+      run_once: true
+      delegate_to: localhost
+
+    # ========================================
+    # 2. Gather SAP Host Info
+    # ========================================
+    - name: "Gather SAP Host Info"
+      sap.sap_operations.host_info:
+      register: sap_info_raw
+
+    # ========================================
+    # 4. Get HANA Version from Database Hosts
+    # ========================================
+    - name: "Get HANA Version from sap_info (DatabaseProperties)"
+      set_fact:
+        hdb_metadata: "{{ hdb_metadata | default([]) + [{'item': item, 'stdout': item.DatabaseProperties['Database/DBRelease'] | default('N/A')}] }}"
+      loop: "{{ sap_info_raw.databases | default([], true) }}"
+      when:
+        - sap_info_raw.databases is defined
+        - item.mDatabase['Database/Type'] | default('') == 'hdb'
+
+    # ========================================
+    # 5. Get HANA Client Version from App Servers
+    # ========================================
+    - name: "Get HANA Client Version (hdbsql)"
+      shell: "su - {{ item.mSid | lower }}adm -c '/usr/sap/{{ item.mSid }}/hdbclient/hdbsql -v'"
+      register: hdbclient_metadata
+      loop: "{{ sap_info_raw.instances | default([], true) }}"
+      when: 
+        - sap_info_raw.instances is defined
+        - "'disp+work' in item.ProcessList | map(attribute='name') | list"
+      changed_when: false
+      failed_when: false
+
+    # ========================================
+    # 7b. Determine OS Upgrade Applicability
+    # ========================================
+    - name: "Set OS Upgrade Applicable Flag"
+      set_fact:
+        os_upgrade_applicable: "{{ (ansible_os_family | default('') | lower) == 'redhat' }}"
+
+    # ========================================
+    # 8. Determine Kernel Upgrade Applicability
+    # ========================================
+    - name: "Check if Kernel Upgrade is Applicable"
+      set_fact:
+        has_kernel_instance: >-
+          {{
+            sap_info_raw.instances | default([]) |
+            selectattr('ProcessList', 'defined') |
+            map(attribute='ProcessList') |
+            flatten |
+            map(attribute='name') |
+            list |
+            intersect(host_info_kernel_instance_markers) |
+            length > 0
+          }}
+        has_patch_level: >-
+          {{
+            sap_info_raw.instances | default([]) |
+            selectattr('mSapVersionInfo', 'defined') |
+            selectattr('mSapVersionInfo', 'search', 'patch') |
+            list |
+            length > 0
+          }}
+
+    - name: "Set Kernel Upgrade Applicable Flag"
+      set_fact:
+        kernel_upgrade_applicable: "{{ has_kernel_instance | bool and has_patch_level | bool }}"
+
+    # ========================================
+    # 8b. Determine HANA Upgrade Applicability
+    # ========================================
+    - name: "Check if HANA Upgrade is Applicable"
+      set_fact:
+        has_hana_database: >-
+          {{
+            sap_info_raw.databases | default([]) |
+            selectattr('mDatabase', 'defined') |
+            map(attribute='mDatabase') |
+            selectattr('Database/Type', 'equalto', 'hdb') |
+            list |
+            length > 0
+          }}
+
+    - name: "Set HANA Upgrade Applicable Flag"
+      set_fact:
+        hana_upgrade_applicable: "{{ has_hana_database | bool }}"
+
+    # ========================================
+    # 9. Kernel Environment Comparison (optional)
+    # ========================================
+    - name: "Compare Kernel with next Environment"
+      include_tasks: tasks/compare_kernel_environments.yml
+      when: compare_kernel_with_next_env | default(false) | bool
+
+    # ========================================
+    # 10. Generate Consolidated Report
+    # ========================================
+    - name: "Generate Consolidated Report"
+      template:
+        src: "{{ playbook_dir }}/../templates/sap_host_info_report.j2"
+        dest: "{{ playbook_dir }}/../reports/sap_landscape_{{ report_time }}.md"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    # ========================================
+    # 11. Convert Report to HTML and Send Email
+    # ========================================
+    - name: "Convert Report to HTML"
+      shell: |
+        python3 "{{ playbook_dir }}/../scripts/md_to_html_email.py" \
+          "{{ playbook_dir }}/../reports/sap_landscape_{{ report_time }}.md" \
+          "{{ playbook_dir }}/../reports/sap_landscape_{{ report_time }}.html" \
+          --title "SAP System Landscape Report - {{ ansible_date_time.date }}"
+      delegate_to: localhost
+      run_once: true
+      become: false
+      when: email_recipient | default('none') != 'none'
+
+    - name: "Convert Kernel Comparison to HTML (if exists)"
+      shell: |
+        if [ -f "{{ kernel_comparison_report | default('/nonexistent') }}" ]; then
+          python3 "{{ playbook_dir }}/../scripts/md_to_html_email.py" \
+            "{{ kernel_comparison_report }}" \
+            "{{ kernel_comparison_report | replace('.md', '.html') }}" \
+            --title "Kernel Environment Comparison - {{ customer_name }} - {{ ansible_date_time.date }}"
+        fi
+      delegate_to: localhost
+      run_once: true
+      become: false
+      when:
+        - email_recipient | default('none') != 'none'
+        - kernel_comparison_report is defined
+
+    - name: "Build attachment list for kernel comparison"
+      set_fact:
+        _email_attachments: >-
+          {{ [{'path': kernel_comparison_report | replace('.md', '.html'), 'filename': 'kernel_comparison.html'}]
+             if (kernel_comparison_report is defined and kernel_comparison_report | replace('.md', '.html') is file)
+             else [] }}
+      delegate_to: localhost
+      run_once: true
+      when: email_recipient | default('none') != 'none'
+
+    - name: "Send Report Email"
+      include_role:
+        name: send_email
+      vars:
+        email_recipient: "{{ email_recipient }}"
+        email_subject: "SAP System Landscape Report - {{ customer_name | default('ALL') }} - {{ ansible_date_time.date }}"
+        email_html_file: "{{ playbook_dir }}/../reports/sap_landscape_{{ report_time }}.html"
+        email_attachment_files: "{{ _email_attachments | default([]) }}"
+      when: email_recipient | default('none') != 'none'
+      run_once: true

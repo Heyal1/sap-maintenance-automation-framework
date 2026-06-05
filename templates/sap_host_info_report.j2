@@ -1,0 +1,285 @@
+{# ==========================================================================
+   Template: sap_host_info_report.j2
+   ===========================================================================
+   Generates the SAP System Landscape Report (Pipeline 0: Host Info).
+
+   Sections:
+     1. Host Inventory & SAP Components - per-host instance table
+     2. Update Applicability - per-host OS/kernel/HANA applicability flags
+     3. Upgrade Applicability Guide (conditional) - kernel/HANA guide
+     4. Process Details Appendix - full process lists per instance
+
+   Instance role detection priority (by process name):
+     hdbdaemon   → HANA Database Instance
+     disp+work   → App Server (PAS/DIA)
+     msg_server  → Central Services (ASCS)
+     enqrepl*    → Enqueue Replicator (ERS)
+     sapwebdisp  → Web Dispatcher
+     smdagent    → Diagnostic Agent (DAA SID only)
+
+   Version extraction:
+     - HANA: from hdb_metadata (HDB version output)
+     - Kernel: regex on mSapVersionInfo from sap.sap_operations.host_info
+       Format: "Kernel <release> P<patch>" (e.g. "Kernel 7.77 P1234")
+     - Kernel executable matrix: from instance.VersionInfo
+       (GetVersionInfo via sap.sap_operations.host_info)
+     - HANA Client: from hdbclient_metadata (hdbsql -v output)
+
+   Global lists (appended across loop iterations for summary stats):
+     global_kernel_releases - all unique kernel release numbers found
+     global_patch_levels    - all unique patch levels found
+   ========================================================================== #}
+# SAP SYSTEM LANDSCAPE REPORT
+
+| Field | Value |
+|-------|-------|
+| Report Generated | {{ ansible_date_time.date }} {{ ansible_date_time.time }} (Server: {{ ansible_hostname | default('controller') }}) |
+| Pipeline Run | {{ pipeline_run_id | default('local') }} |
+| Customer | {{ customer_name | default('UNKNOWN') }} |
+| Environment | {{ sap_environment | default('UNKNOWN') }} |
+
+---
+
+{% set global_kernel_releases = [] %}
+{% set global_patch_levels = [] %}
+## 1. HOST INVENTORY AND SAP COMPONENTS
+
+> **Note:** Process details for each instance are listed in the appendix at the end of this report.
+
+{% for host in ansible_play_hosts | sort %}
+{% set hvars = hostvars[host] %}
+
+---
+
+### {{ host | upper }}
+
+| Property | Value |
+|----------|-------|
+| Operating System | {{ hvars.ansible_distribution | default('N/A') }} {{ hvars.ansible_distribution_version | default('') }} ({{ hvars.ansible_architecture | default('N/A') }}) |
+| IP Address | {{ hvars.ansible_default_ipv4.address | default('N/A') }} |
+
+#### Update Applicability
+
+| Update Type | Applicable |
+|-------------|------------|
+| OS | {{ 'true' if hvars.os_upgrade_applicable | default(false) | bool else 'false' }} |
+| Kernel | {{ 'true' if hvars.kernel_upgrade_applicable | default(false) | bool else 'false' }} |
+| HANA | {{ 'true' if hvars.hana_upgrade_applicable | default(false) | bool else 'false' }} |
+
+{% if hvars.sap_info_raw.instances is defined and hvars.sap_info_raw.instances | length > 0 %}
+#### SAP Instances
+
+| SID | Nr | Role | Status | Version |
+|-----|----|------|--------|---------|
+{% for inst in hvars.sap_info_raw.instances %}
+{% set pnames = inst.ProcessList | map(attribute='name') | list %}
+{% set ns_i = namespace(role='SAP Instance', version='N/A') %}
+{% if inst.mSid == 'DAA' and ('smdagent' in pnames or 'jstart' in pnames) %}
+{% set ns_i.role = 'Diagnostic Agent' %}
+{% elif 'hdbdaemon' in pnames %}
+{% set ns_i.role = 'HANA Database Instance' %}
+{% elif 'disp+work' in pnames %}
+{% set ns_i.role = 'App Server (PAS/DIA)' %}
+{% elif 'msg_server' in pnames %}
+{% set ns_i.role = 'Central Services (ASCS)' %}
+{% elif 'enqreplserver' in pnames %}
+{% set ns_i.role = 'Enqueue Replicator (ERS)' %}
+{% elif 'sapwebdisp' in pnames %}
+{% set ns_i.role = 'Web Dispatcher' %}
+{% endif %}
+{% set green_procs = inst.ProcessList | selectattr('dispstatus', 'equalto', 'SAPControl-GREEN') | list %}
+{% set total_procs = inst.ProcessList | length %}
+{% if 'hdbdaemon' in pnames and hvars.hdb_metadata is defined %}
+{% for hdb in hvars.hdb_metadata %}
+{% if hdb.stdout is defined and hdb.stdout != 'N/A' and hdb.item.mDatabase['Database/Name'] | regex_search('SYSTEMDB@' + inst.mSid) %}
+{% set ns_i.version = hdb.stdout %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if pnames | intersect(['disp+work', 'msg_server', 'enqreplserver', 'sapwebdisp']) | length > 0 %}
+{% set k_rel = inst.mSapVersionInfo | default('') | regex_findall('^([0-9]+)') | first | default('') %}
+{% set k_ptc = inst.mSapVersionInfo | default('') | regex_findall('patch\s+(\d+)') | first | default('') %}
+{% if k_rel and k_ptc %}
+{% set k_rel_dotted = (k_rel[0] + '.' + k_rel[1:]) if (k_rel | length > 1) else k_rel %}
+{% set ns_i.version = 'Kernel ' + k_rel_dotted + ' P' + k_ptc %}
+{% if global_kernel_releases.append(k_rel_dotted) %}{% endif %}
+{% if global_patch_levels.append(k_ptc) %}{% endif %}
+{% if hvars.hdbclient_metadata.results is defined %}
+{% for client_res in hvars.hdbclient_metadata.results %}
+{% if client_res.item.mSid == inst.mSid and client_res.stdout is defined %}
+{% set client_ver = client_res.stdout | regex_findall('version:?\s+([0-9.]+)') | first | default('') %}
+{% if client_ver %}
+{% set ns_i.version = ns_i.version + ' / Client ' + client_ver %}
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endif %}
+| {{ inst.mSid }} | {{ inst.mSystemNumber }} | {{ ns_i.role }} | {{ green_procs | length }}/{{ total_procs }} SAP Processes {{ 'GREEN' if green_procs | length == total_procs else 'WARNING' }} | {{ ns_i.version }} |
+{% endfor %}
+
+{% endif %}
+{% set kernel_instances = [] %}
+{% for inst in hvars.sap_info_raw.instances | default([]) %}
+{% set inst_pnames = inst.ProcessList | default([]) | map(attribute='name') | list %}
+{% if inst_pnames | intersect(['disp+work', 'msg_server', 'enqreplserver', 'sapwebdisp']) | length > 0 and inst.VersionInfo is defined and inst.VersionInfo | length > 0 %}
+{% if kernel_instances.append(inst) %}{% endif %}
+{% endif %}
+{% endfor %}
+{% if kernel_instances | length > 0 %}
+#### Kernel Executable Versions
+
+| SID | Nr | Executable | Version |
+|-----|----|------------|---------|
+{% for inst in kernel_instances %}
+{% for exe in inst.VersionInfo | default([]) | selectattr('Filename', 'defined') | sort(attribute='Filename') %}
+| {{ inst.mSid }} | {{ inst.mSystemNumber }} | {{ exe.Filename | basename }} | {{ exe.VersionInfo | default('Version could not be determined') }} |
+{% endfor %}
+{% endfor %}
+
+{% endif %}
+{% if hvars.sap_info_raw.databases is defined and hvars.sap_info_raw.databases | length > 0 %}
+#### Database Tenants
+
+| Tenant | Type | Status |
+|--------|------|--------|
+{% for db in hvars.sap_info_raw.databases %}
+| {{ db.mDatabase['Database/Name'] }} | {{ db.mDatabase['Database/Type'] | upper }} | {{ db.mDatabase['Database/Status'] }} |
+{% endfor %}
+
+{% endif %}
+{% if hvars.sap_info_raw.instances is not defined and hvars.sap_info_raw.databases is not defined %}
+*No SAP components detected on this host.*
+
+{% endif %}
+{% endfor %}
+
+{% set ns = namespace(any_kernel=false, any_hana=false) %}
+{% for host in ansible_play_hosts %}
+{% if hostvars[host].kernel_upgrade_applicable | default(false) | bool %}{% set ns.any_kernel = true %}{% endif %}
+{% if hostvars[host].hana_upgrade_applicable | default(false) | bool %}{% set ns.any_hana = true %}{% endif %}
+{% endfor %}
+{% set show_kernel_guide = (include_kernel_guide | default(true) | bool) and ns.any_kernel %}
+{% set show_hana_guide = (include_hana_guide | default(false) | bool) and ns.any_hana %}
+{% if show_kernel_guide or show_hana_guide %}
+---
+
+## 2. DOWNLOAD MANIFEST
+
+Software Center: [https://me.sap.com/softwarecenter](https://me.sap.com/softwarecenter)
+Download files directly or add them to the Download Basket of the technical S-User.
+
+### SAPCAR (always required)
+
+Search for **SAPCAR** in the Software Center → download the latest version for **LINUX ON X86_64**.
+
+| File | Description |
+|------|-------------|
+| `SAPCAR_<Version>.EXE` | SAPCAR archive tool |
+
+{% endif %}
+{% if show_kernel_guide %}
+{% set max_kernel = global_kernel_releases | unique | sort | last | default('7.77') %}
+{% set max_patch = global_patch_levels | map('int') | max | default(439) %}
+### {{ 'A) ' if show_hana_guide else '' }}SAP Kernel Update
+
+| Field | Value |
+|-------|-------|
+| Current Version | Kernel **{{ max_kernel }}** Patch **{{ max_patch }}** |
+| Path | Support Packages and Patches → A-Z → **K** → SAP KERNEL 64-BIT UNICODE |
+| Sub-Path | SAP KERNEL {{ max_kernel }} 64-BIT UNICODE → LINUX ON X86_64 64BIT |
+
+**IMPORTANT:** All files must be from the **SAME** (highest) patch level!
+
+| File | Description |
+|------|-------------|
+| `SAPEXE_*.SAR` | Kernel Executables |
+| `SAPEXEDB_*.SAR` | DB-Dependent Kernel (select HANA in dropdown) |
+| `dw_*.sar` | Dispatcher / Work Process |
+| `sapnwrfc_*.sar` | RFC Library |
+| `libscu_*.sar` | Security / SNC Library |
+| `igsexe_*.sar` | IGS (latest version) |
+| `igshelper_*.sar` | IGS Helper (latest version) |
+
+{% endif %}
+{% if show_hana_guide %}
+{% set hana_versions = [] %}
+{% for host in ansible_play_hosts %}
+{% set hvars = hostvars[host] %}
+{% if hvars.hdb_metadata is defined %}
+{% for hdb in hvars.hdb_metadata %}
+{% if hdb.stdout is defined and hdb.stdout != 'N/A' %}
+{% if hana_versions.append(hdb.stdout) %}{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% set hana_ver = hana_versions | unique | sort | last | default('') %}
+{% set hana_sps = 'SPS' + '%02d' | format(((hana_ver.split('.')[2] | default('0') | int) // 10)) if hana_ver else 'unknown' %}
+{% set hana_rev = hana_ver.split('.')[2] | default('?') if hana_ver else '?' %}
+### {{ 'B) ' if show_kernel_guide else '' }}SAP HANA Update
+
+| Field | Value |
+|-------|-------|
+| Current Version | **{{ hana_ver if hana_ver else 'N/A' }}** ({{ hana_sps }} Rev {{ hana_rev }}) |
+| Path | Support Packages and Patches → A-Z → **H** → SAP HANA PLATFORM EDITION |
+| Sub-Path | SAP HANA PLATFORM EDIT. 2.0 → SAP HANA DATABASE 2.0 → LINUX ON X86_64 64BIT |
+
+Select a target revision **higher than Rev {{ hana_rev }}**.
+
+**1. HANA Server Medium:**
+
+| File | Description |
+|------|-------------|
+| `IMDB_SERVER*.SAR` | HANA installation medium (~2–4 GB) |
+
+**2. HANA Client (not automated):**
+
+HANA Client updates on Application Servers require `hdbinst` (not `hdblcm`) and are currently not supported by the automation. Install manually if needed.
+
+| File | Description |
+|------|-------------|
+| `IMDB_CLIENT*.SAR` | HANA Client for Application Servers (manual install) |
+
+{% endif %}
+{% if show_kernel_guide or show_hana_guide %}
+### Next Steps: Staging - SAP Patch preparation
+
+| Option | Method | Description |
+|--------|--------|-------------|
+| A | `auto` | Leave files in Download Basket → run "Staging - SAP Patch preparation" with method **auto** |
+| B | `manual` | Place files in a directory on the controller → run "Staging - SAP Patch preparation" with method **manual** |
+
+The Staging pipeline handles extraction, categorization and distribution to the correct hosts.
+
+{% endif %}
+
+---
+
+## APPENDIX: PROCESS DETAILS
+
+{% for host in ansible_play_hosts | sort %}
+{% set hvars = hostvars[host] %}
+{% if hvars.sap_info_raw.instances is defined and hvars.sap_info_raw.instances | length > 0 %}
+### {{ host | upper }}
+
+{% for inst in hvars.sap_info_raw.instances %}
+{% set green_procs = inst.ProcessList | selectattr('dispstatus', 'equalto', 'SAPControl-GREEN') | list %}
+{% set total_procs = inst.ProcessList | length %}
+**{{ inst.mSid }} ({{ inst.mSystemNumber }})** — {{ green_procs | length }}/{{ total_procs }} GREEN
+
+| Process | Status | Description |
+|---------|--------|-------------|
+{% for proc in inst.ProcessList | sort(attribute='name') %}
+| {{ proc.name }} | {% if proc.dispstatus == 'SAPControl-GREEN' %}✓ GREEN{% elif proc.dispstatus == 'SAPControl-YELLOW' %}⚠ YELLOW{% else %}✗ {{ proc.dispstatus | replace('SAPControl-', '') }}{% endif %} | {{ proc.description | default('') }} |
+{% endfor %}
+
+{% endfor %}
+{% endif %}
+{% endfor %}
+
+---
+
+*For questions regarding this report, contact the SAP Basis team.*
+*Report generated by SAP Kernel Update Automation Framework.*

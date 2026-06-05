@@ -1,0 +1,202 @@
+# ============================================================================
+# Azure DevOps Pipeline: Staging - SAP Patch preparation
+# ============================================================================
+# Purpose: Stage SAP files (Kernel, HANA, Hostagent) for target hosts
+# Methods:
+#   - local: Copy from local controller directory
+#   - download_basket: Download from SAP Download Basket (S-User required)
+# Flow: Download/Copy -> Categorize -> Extract -> Distribute by host type
+# ============================================================================
+
+trigger: none
+
+pool:
+  name: 'SAP Maintenance Runner'
+
+parameters:
+  # --- TARGET SELECTION ---
+  - name: customer
+    displayName: 'Customer'
+    type: string
+    default: 'DEMO'
+    values:
+      - 'DEMO'
+      - 'TENANT_A'
+      - 'TENANT_B'
+      - 'TENANT_C'
+
+  - name: environment
+    displayName: 'SAP Environment'
+    type: string
+    default: 'DEV'
+    values:
+      - 'DEV'
+      - 'QAS'
+      - 'PRD'
+
+  # --- METHOD SELECTION ---
+  - name: staging_method
+    displayName: 'Staging Method (SAPCAR*.EXE must be included in source files for both methods)'
+    type: string
+    default: 'local'
+    values:
+      - local
+      - download_basket
+
+  # --- COMPONENT FILTER (all checked = stage everything, uncheck to skip) ---
+  - name: stage_kernel
+    displayName: 'Stage: SAP Kernel (SAPEXE, SAPEXEDB, dw_, R3trans, tp_)'
+    type: boolean
+    default: true
+
+  - name: stage_hana
+    displayName: 'Stage: HANA (IMDB_SERVER + IMDB_CLIENT if both files are in the source path)'
+    type: boolean
+    default: true
+
+  - name: stage_hostagent
+    displayName: 'Stage: Host Agent (SAPHOSTAGENT)'
+    type: boolean
+    default: true
+
+  # --- LOCAL METHOD ---
+  - name: source_directory
+    displayName: '[local] Source Directory'
+    type: string
+    default: '/home/aktansible/sap_staging/source/'
+    # IMPORTANT: The default path can be reused across customers, but ensure the
+    # correct SAR/EXE files for the selected customer are placed there before running.
+    # Using files from the wrong customer will distribute incorrect patches!
+    # NOTE: A SAPCAR executable (SAPCAR*.EXE) must always be present in the source
+    # directory regardless of method (local or download_basket). It is required to
+    # extract SAR archives. The pipeline will fail if SAPCAR is missing.
+
+  # --- REPORTING ---
+  - name: email_recipient
+    displayName: 'Email Report Recipient (none = no email)'
+    type: string
+    default: 'none'
+
+variables:
+  - group: SAP-Maintenance-Demo-Secrets
+  - name: ANSIBLE_FORCE_COLOR
+    value: 'true'
+  - name: ANSIBLE_LOG_PATH
+    value: $(System.DefaultWorkingDirectory)/ansible_staging.log
+  - name: ANSIBLE_COLLECTIONS_PATH
+    value: $(Build.SourcesDirectory)/local_collections:~/.ansible/collections
+  - name: ANSIBLE_CONFIG
+    value: $(Build.SourcesDirectory)/ansible.cfg
+  - name: PIPELINE_RUN_ID
+    value: $(Build.BuildId)
+  - name: PROJECT_ROOT
+    value: '$(Build.SourcesDirectory)'
+
+stages:
+  - stage: Execute
+    displayName: 'Stage SAP Files'
+    jobs:
+      - job: Staging
+        displayName: 'Run Staging'
+        workspace:
+          clean: all
+        steps:
+          - checkout: self
+            clean: true
+
+          # 1. Log selected staging configuration for pipeline traceability
+          - bash: |
+              fail() {
+                echo "##vso[task.logissue type=error]$1"
+                exit 1
+              }
+
+              warn() {
+                echo "##vso[task.logissue type=warning]$1"
+              }
+
+              assert_regex() {
+                local name="$1"
+                local value="$2"
+                local pattern="$3"
+                local description="$4"
+
+                if [[ ! "$value" =~ $pattern ]]; then
+                  fail "Invalid ${name}: ${description}. Received '${value}'."
+                fi
+              }
+
+              LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+
+              if [[ "${PARAM_STAGE_KERNEL,,}" != "true" && "${PARAM_STAGE_HANA,,}" != "true" && "${PARAM_STAGE_HOSTAGENT,,}" != "true" ]]; then
+                fail "At least one staging component must be selected."
+              fi
+
+              if [[ "$PARAM_STAGING_METHOD" == "local" && -z "$PARAM_SOURCE_DIRECTORY" ]]; then
+                fail "source_directory must be set when staging_method=local."
+              fi
+
+              if [[ "$PARAM_EMAIL_RECIPIENT" != "none" ]]; then
+                assert_regex "email_recipient" "$PARAM_EMAIL_RECIPIENT" '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' 'must be none or a valid email address'
+              fi
+
+              echo "=============================================="
+              echo "STAGING CONFIGURATION"
+              echo "=============================================="
+              echo "Target:          $LIMIT"
+              echo "Run ID:          $PIPELINE_RUN_ID"
+              echo "Method:          $PARAM_STAGING_METHOD"
+              echo "Source:          $PARAM_SOURCE_DIRECTORY"
+              echo "Components:      Kernel=$PARAM_STAGE_KERNEL | HANA=$PARAM_STAGE_HANA | Hostagent=$PARAM_STAGE_HOSTAGENT"
+              echo "Email Recipient: $PARAM_EMAIL_RECIPIENT"
+              echo "=============================================="
+            displayName: 'Validate Prerequisites'
+            env:
+              PARAM_CUSTOMER: '${{ parameters.customer }}'
+              PARAM_ENVIRONMENT: '${{ parameters.environment }}'
+              PARAM_STAGING_METHOD: '${{ parameters.staging_method }}'
+              PARAM_SOURCE_DIRECTORY: '${{ parameters.source_directory }}'
+              PARAM_STAGE_KERNEL: '${{ parameters.stage_kernel }}'
+              PARAM_STAGE_HANA: '${{ parameters.stage_hana }}'
+              PARAM_STAGE_HOSTAGENT: '${{ parameters.stage_hostagent }}'
+              PARAM_EMAIL_RECIPIENT: '${{ parameters.email_recipient }}'
+
+          # 2. Download SAP files from basket/source and distribute to hosts
+          - bash: |
+              LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+
+              ansible-playbook playbooks/02_staging.yml \
+                -i inventory/inventory.yml \
+                -l "$LIMIT" \
+                -e "@vars/common.yml" \
+                -e staging_method=${{ parameters.staging_method }} \
+                -e source_directory=${{ parameters.source_directory }} \
+                -e staging_customer=${{ parameters.customer }} \
+                -e staging_environment=${{ parameters.environment }} \
+                -e pipeline_run_id="$PIPELINE_RUN_ID" \
+                -e stage_kernel=${{ parameters.stage_kernel }} \
+                -e stage_hana=${{ parameters.stage_hana }} \
+                -e stage_hostagent=${{ parameters.stage_hostagent }} \
+                -e email_recipient="${{ parameters.email_recipient }}" \
+                -v
+              ANSIBLE_RC=$?
+
+              echo "=============================================="
+              echo "STAGING PIPELINE FINISHED (rc=$ANSIBLE_RC)"
+              echo "=============================================="
+              exit $ANSIBLE_RC
+            displayName: 'Execute Ansible Staging'
+            workingDirectory: $(PROJECT_ROOT)
+            env:
+              SAP_OPERATIONS_DOWNLOAD_USERNAME: $(SAP-SUPPORT-USER)
+              SAP_OPERATIONS_DOWNLOAD_PASSWORD: $(SAP-SUPPORT-PASSWORD)
+              ANSIBLE_HOST_KEY_CHECKING: 'False'
+              ANSIBLE_COLLECTIONS_PATH: $(System.DefaultWorkingDirectory)/local_collections
+
+          # 3. Publish Logs
+          - task: PublishBuildArtifacts@1
+            condition: always()
+            displayName: 'Publish Execution Logs'
+            inputs:
+              PathtoPublish: '$(ANSIBLE_LOG_PATH)'
+              ArtifactName: 'Staging-Log'

@@ -1,0 +1,28 @@
+# =============================================================================
+# Shared Task: create_state_directory.yml
+# =============================================================================
+# Normalizes per-run, per-SID state paths on the controller so each pipeline
+# execution writes isolated state below <customer>/<env>/<run_id>/<sid>/.
+# Optional inputs:
+#   target_state_sid: Override SID for shared-host or per-tenant state writes.
+# =============================================================================
+
+- name: "Normalize state directory inputs"
+  set_fact:
+    _state_customer: "{{ staging_customer | default('UNKNOWN', true) }}"
+    _state_environment: "{{ staging_environment | default('UNKNOWN', true) }}"
+    _state_run_id: "{{ pipeline_run_id | default('local', true) | string | trim }}"
+    _state_sid: "{{ target_state_sid | default(sap_sid | default(inventory_hostname, true), true) }}"
+
+- name: "Build run-scoped state directory paths"
+  set_fact:
+    _state_run_dir: "{{ controller_state_base }}/{{ _state_customer }}/{{ _state_environment }}/{{ _state_run_id }}"
+    _state_dir: "{{ controller_state_base }}/{{ _state_customer }}/{{ _state_environment }}/{{ _state_run_id }}/{{ _state_sid }}"
+
+- name: "Ensure run-scoped state directory exists"
+  file:
+    path: "{{ _state_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  become: false

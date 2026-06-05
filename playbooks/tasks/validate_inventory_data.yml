@@ -1,0 +1,184 @@
+---
+# =============================================================================
+# Shared Task: validate_inventory_data.yml
+# =============================================================================
+# Validates inventory metadata at ingestion time before downstream PreCheck
+# tasks depend on host SIDs, shared HANA instance numbering, or tenant customer
+# mappings.
+# =============================================================================
+
+- name: "Initialize inventory validation issue list"
+  set_fact:
+    precheck_inventory_validation_issues: []
+
+- name: "Record missing sap_sids list"
+  set_fact:
+    precheck_inventory_validation_issues: >-
+      {{
+        precheck_inventory_validation_issues
+        + [
+          {
+            'component': 'sap_sids',
+            'reason': 'Host ' ~ inventory_hostname ~ ' must define sap_sids with at least one 3-character alphanumeric SID.'
+          }
+        ]
+      }}
+  when: (sap_sids | default([]) | length) == 0
+
+- name: "Record invalid dedicated-host sap_sid format"
+  set_fact:
+    precheck_inventory_validation_issues: >-
+      {{
+        precheck_inventory_validation_issues
+        + [
+          {
+            'component': 'sap_sid',
+            'reason': 'Host ' ~ inventory_hostname ~ ' has invalid sap_sid ' ~ (sap_sid | default('undefined') | string) ~ '. Expected a 3-character alphanumeric SID.'
+          }
+        ]
+      }}
+  when:
+    - not (hana_shared | default(false) | bool)
+    - not ((sap_sid | default('') | string | upper) is match('^[A-Z0-9]{3}$'))
+
+- name: "Record invalid shared-host sap_sid marker"
+  set_fact:
+    precheck_inventory_validation_issues: >-
+      {{
+        precheck_inventory_validation_issues
+        + [
+          {
+            'component': 'sap_sid',
+            'reason': 'Shared host ' ~ inventory_hostname ~ ' must use sap_sid SHARED, but found ' ~ (sap_sid | default('undefined') | string) ~ '.'
+          }
+        ]
+      }}
+  when:
+    - hana_shared | default(false) | bool
+    - (sap_sid | default('') | string | upper) != 'SHARED'
+
+- name: "Record invalid sap_sids entry format"
+  set_fact:
+    precheck_inventory_validation_issues: >-
+      {{
+        precheck_inventory_validation_issues
+        + [
+          {
+            'component': 'sap_sids',
+            'reason': 'Host ' ~ inventory_hostname ~ ' contains invalid SID ' ~ (item | string) ~ ' in sap_sids. Expected a 3-character alphanumeric SID.'
+          }
+        ]
+      }}
+  loop: "{{ sap_sids | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ((item | string | upper) is match('^[A-Z0-9]{3}$'))
+
+- name: "Record missing shared HANA instance definitions"
+  set_fact:
+    precheck_inventory_validation_issues: >-
+      {{
+        precheck_inventory_validation_issues
+        + [
+          {
+            'component': 'hana_instances',
+            'reason': 'Shared host ' ~ inventory_hostname ~ ' must define at least one hana_instances entry.'
+          }
+        ]
+      }}
+  when:
+    - hana_shared | default(false) | bool
+    - (hana_instances | default([]) | length) == 0
+
+- name: "Record invalid shared HANA instance SID format"
+  set_fact:
+    precheck_inventory_validation_issues: >-
+      {{
+        precheck_inventory_validation_issues
+        + [
+          {
+            'component': 'hana_instances[].instance_name',
+            'reason': 'Shared host ' ~ inventory_hostname ~ ' has invalid instance_name ' ~ (item.instance_name | default('undefined') | string) ~ '. Expected a 3-character alphanumeric SID.'
+          }
+        ]
+      }}
+  loop: "{{ hana_instances | default([]) }}"
+  loop_control:
+    label: "{{ item.instance_name | default('undefined') }}"
+  when:
+    - hana_shared | default(false) | bool
+    - not ((item.instance_name | default('') | string | upper) is match('^[A-Z0-9]{3}$'))
+
+- name: "Record invalid shared HANA instance number format"
+  set_fact:
+    precheck_inventory_validation_issues: >-
+      {{
+        precheck_inventory_validation_issues
+        + [
+          {
+            'component': 'hana_instances[].instance_nr',
+            'reason': 'Shared host ' ~ inventory_hostname ~ ' has invalid instance_nr ' ~ (item.instance_nr | default('undefined') | string) ~ ' for instance ' ~ (item.instance_name | default('undefined') | string) ~ '. Expected a 2-digit numeric string.'
+          }
+        ]
+      }}
+  loop: "{{ hana_instances | default([]) }}"
+  loop_control:
+    label: "{{ item.instance_name | default('undefined') }}:{{ item.instance_nr | default('undefined') }}"
+  when:
+    - hana_shared | default(false) | bool
+    - not ((item.instance_nr | default('') | string) is match('^[0-9]{2}$'))
+
+- name: "Record invalid shared HANA tenant SID format"
+  set_fact:
+    precheck_inventory_validation_issues: >-
+      {{
+        precheck_inventory_validation_issues
+        + [
+          {
+            'component': 'hana_instances[].tenants[].sid',
+            'reason': 'Shared host ' ~ inventory_hostname ~ ' has invalid tenant SID ' ~ (_shared_tenant.sid | default('undefined') | string) ~ ' on instance ' ~ (_shared_instance.instance_name | default('undefined') | string) ~ '. Expected a 3-character alphanumeric SID.'
+          }
+        ]
+      }}
+  loop: "{{ (hana_instances | default([])) | subelements('tenants', skip_missing=true) }}"
+  loop_control:
+    loop_var: shared_tenant_entry
+    label: "{{ shared_tenant_entry.0.instance_name | default('undefined') }}:{{ shared_tenant_entry.1.sid | default('undefined') }}"
+  vars:
+    _shared_instance: "{{ shared_tenant_entry.0 }}"
+    _shared_tenant: "{{ shared_tenant_entry.1 }}"
+  when:
+    - hana_shared | default(false) | bool
+    - not ((_shared_tenant.sid | default('') | string | upper) is match('^[A-Z0-9]{3}$'))
+
+- name: "Record invalid shared HANA tenant customer names"
+  set_fact:
+    precheck_inventory_validation_issues: >-
+      {{
+        precheck_inventory_validation_issues
+        + [
+          {
+            'component': 'hana_instances[].tenants[].customer',
+            'reason': _shared_customer_reason
+          }
+        ]
+      }}
+  loop: "{{ (hana_instances | default([])) | subelements('tenants', skip_missing=true) }}"
+  loop_control:
+    loop_var: shared_customer_entry
+    label: "{{ shared_customer_entry.0.instance_name | default('undefined') }}:{{ shared_customer_entry.1.customer | default('undefined') }}"
+  vars:
+    _shared_instance: "{{ shared_customer_entry.0 }}"
+    _shared_tenant: "{{ shared_customer_entry.1 }}"
+    _shared_customer: "{{ _shared_tenant.customer | default('') | string | trim }}"
+    _shared_customer_reason: >-
+      {%- if not (_shared_customer is match('^[A-Z0-9_]{2,20}$')) -%}
+      Shared host {{ inventory_hostname }} has invalid customer name {{ _shared_customer | default('undefined', true) }} for tenant {{ _shared_tenant.sid | default('undefined') }} on instance {{ _shared_instance.instance_name | default('undefined') }}. Use 2-20 uppercase letters, digits, or underscores.
+      {%- elif not (_shared_customer in groups) -%}
+      Shared host {{ inventory_hostname }} references unknown customer group {{ _shared_customer }} for tenant {{ _shared_tenant.sid | default('undefined') }} on instance {{ _shared_instance.instance_name | default('undefined') }}.
+      {%- else -%}
+      Shared host {{ inventory_hostname }} has an invalid customer mapping for tenant {{ _shared_tenant.sid | default('undefined') }} on instance {{ _shared_instance.instance_name | default('undefined') }}.
+      {%- endif -%}
+  when:
+    - hana_shared | default(false) | bool
+    - not ((_shared_customer is match('^[A-Z0-9_]{2,20}$')) and (_shared_customer in groups))

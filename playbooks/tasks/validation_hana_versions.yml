@@ -1,0 +1,38 @@
+---
+# =============================================================================
+# Shared Task: validation_hana_versions.yml
+# =============================================================================
+# Compares the HANA database version BEFORE (from precheck state file) with
+# the current AFTER version. Both values are set as host facts so the
+# maintenance_report.j2 template can display them in the version table.
+#
+# State tracking: BEFORE version was saved by precheck_hana_versions.yml
+# as a plain text file, loaded here via slurp (base64) and decoded.
+#
+# Only runs on HANA hosts (is_hana=true).
+# Included by: 03_maintenance_validation.yml (when do_hana=true)
+# =============================================================================
+
+- name: "Get HANA Version AFTER Update"
+  shell: |
+    su - {{ sap_sid | lower }}adm -c \
+      "HDB version | grep 'version:' | head -1 | awk '{print \$2}'"
+  register: hana_ver_after
+  changed_when: false
+  failed_when: false
+  when: is_hana | default(false)
+
+- name: "Load HANA BEFORE Version"
+  slurp:
+    src: "{{ _state_dir }}/hana_ver_before_{{ inventory_hostname }}.txt"
+  delegate_to: localhost
+  register: hana_ver_before_file
+  failed_when: false
+  when: is_hana | default(false)
+
+- name: "Set HANA Version Variables"
+  set_fact:
+    hana_version_before: "{{ (hana_ver_before_file.content | b64decode).strip() if (hana_ver_before_file.content is defined) else 'N/A' }}"
+    hana_version_after: "{{ hana_ver_after.stdout | default('N/A') }}"
+  when: is_hana | default(false)
+

@@ -1,0 +1,79 @@
+---
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/playbook
+# Diagnostic playbook: Check why kernel_upgrade_applicable is false
+# Usage: ansible-playbook playbooks/debug_kernel_applicability.yml -i inventory/inventory.yml -l demo-app-01 -v
+- name: "Debug Kernel Upgrade Applicability"
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    host_info_kernel_instance_markers:
+      - disp+work
+      - msg_server
+      - enqreplserver
+      - sapwebdisp
+  tasks:
+    - name: "Gather SAP Host Info"
+      sap.sap_operations.host_info:
+      register: sap_info_raw
+
+    - name: "Show instance count"
+      debug:
+        msg: "Total instances: {{ sap_info_raw.instances | default([]) | length }}"
+
+    - name: "Show mSapVersionInfo for EACH instance"
+      debug:
+        msg: >-
+          SID={{ item.mSid }}
+          Nr={{ item.mSystemNumber }}
+          mSapVersionInfo_defined={{ item.mSapVersionInfo is defined }}
+          mSapVersionInfo_type={{ item.mSapVersionInfo | default('UNDEFINED') | type_debug }}
+          mSapVersionInfo_value='{{ item.mSapVersionInfo | default('UNDEFINED') }}'
+      loop: "{{ sap_info_raw.instances | default([]) }}"
+      loop_control:
+        label: "{{ item.mSid }}:{{ item.mSystemNumber }}"
+
+    - name: "Show instances passing selectattr('mSapVersionInfo', 'defined')"
+      debug:
+        msg: "{{ sap_info_raw.instances | default([]) | selectattr('mSapVersionInfo', 'defined') | map(attribute='mSid') | list }}"
+
+    - name: "Show mSapVersionInfo values after map"
+      debug:
+        msg: "{{ sap_info_raw.instances | default([]) | selectattr('mSapVersionInfo', 'defined') | map(attribute='mSapVersionInfo') | list }}"
+
+    - name: "Test select('search') on mapped values"
+      debug:
+        msg: "{{ sap_info_raw.instances | default([]) | selectattr('mSapVersionInfo', 'defined') | map(attribute='mSapVersionInfo') | select('search', 'patch\\s+[0-9]+') | list }}"
+
+    - name: "Compute has_kernel_instance"
+      set_fact:
+        has_kernel_instance: >-
+          {{
+            sap_info_raw.instances | default([]) |
+            selectattr('ProcessList', 'defined') |
+            map(attribute='ProcessList') |
+            flatten |
+            map(attribute='name') |
+            list |
+            intersect(host_info_kernel_instance_markers) |
+            length > 0
+          }}
+
+    - name: "Compute has_patch_level"
+      set_fact:
+        has_patch_level: >-
+          {{
+            sap_info_raw.instances | default([]) |
+            selectattr('mSapVersionInfo', 'defined') |
+            map(attribute='mSapVersionInfo') |
+            select('search', 'patch\\s+[0-9]+') |
+            list |
+            length > 0
+          }}
+
+    - name: "Show results"
+      debug:
+        msg:
+          has_kernel_instance: "{{ has_kernel_instance }}"
+          has_patch_level: "{{ has_patch_level }}"
+          kernel_upgrade_applicable: "{{ has_kernel_instance | bool and has_patch_level | bool }}"

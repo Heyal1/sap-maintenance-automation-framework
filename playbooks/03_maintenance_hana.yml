@@ -1,0 +1,723 @@
+# ============================================================================
+# SAP Maintenance: HANA Update
+# ============================================================================
+# Performs HANA authentication setup, backup (SYSTEMDB + all tenants),
+# HANA server update, encryption root keys, and security cleanup.
+# Final SAP application restart is handled by StartApplications.
+#
+# Flow:
+#   1. Create MAINTENANCE hdbuserstore key
+#   2. ALTER USER SYSTEM ACTIVATE USER NOW
+#   3. Backup SYSTEMDB + all tenant databases
+#   4. HANA Server Update (sap.sap_operations.hana_update role)
+#   5. Encryption Root Keys backup password
+#   6. ALTER USER SYSTEM DEACTIVATE USER NOW (always, regardless of key type)
+#   7. Remove MAINTENANCE hdbuserstore key
+#
+# Play 2: HANA Client Update on App Servers (hdbinst, block/rescue)
+#
+# Pipeline Stage: 3b. HanaUpdate
+# ============================================================================
+
+- name: "SAP Maintenance: HANA Update"
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    do_kernel: false
+    do_hana: false
+    do_os_patch: false
+    do_root_keys: false
+    inject_failure_hana: false
+    hana_staging_path: "{{ remote_hana_staging_dir | default('/usr/sap/tmp/staging') }}/hana"
+
+  vars_files:
+    - ../vars/common.yml
+
+  tasks:
+    - name: "Log active switch values"
+      include_tasks: tasks/log_switch_state.yml
+
+    - name: "Run shared SAP discovery"
+      include_tasks: tasks/discover_sap_facts.yml
+
+    - name: "Skip non-HANA hosts"
+      meta: end_host
+      when: not (is_hana | default(false))
+
+    - name: "Ensure run-scoped state directory exists"
+      include_tasks: tasks/create_state_directory.yml
+
+    - name: "Build shared HANA lifecycle contexts"
+      include_tasks: tasks/build_shared_hana_instance_contexts.yml
+      when:
+        - hana_shared | default(false) | bool
+        - do_hana | bool
+        - not (is_netweaver | default(false))
+
+    - name: "Resolve shared HANA credentials per SID"
+      include_tasks: tasks/resolve_shared_hana_sid_credentials.yml
+      when:
+        - hana_shared | default(false) | bool
+        - do_hana | bool
+        - not (is_netweaver | default(false))
+
+    - name: "Determine HANA update scope"
+      set_fact:
+        _is_shared_hana_host: "{{ (hana_shared | default(false) | bool) and (is_hana | default(false) | bool) and not (is_netweaver | default(false) | bool) }}"
+
+    - name: "Resolve dedicated HANA credentials from inventory"
+      set_fact:
+        dedicated_hana_admin_user: "{{ lookup('env', 'HANA_ADMIN_USER') | default('HANA_ADMIN', true) }}"
+        dedicated_hana_admin_password: >-
+          {{
+            lookup('env', (staging_customer | default('', true) | upper) ~ '-HANA-' ~ (sap_sid | default('', true) | upper) ~ '-HANA_ADMIN')
+            | default(lookup('env', (staging_customer | default('', true) | upper) ~ '_HANA_' ~ (sap_sid | default('', true) | upper) ~ '_HANA_ADMIN'), true)
+            | default('', true)
+          }}
+        dedicated_hana_system_user_password: >-
+          {{
+            lookup('env', (staging_customer | default('', true) | upper) ~ '-HANA-' ~ (sap_sid | default('', true) | upper) ~ '-SYSTEM')
+            | default(lookup('env', (staging_customer | default('', true) | upper) ~ '_HANA_' ~ (sap_sid | default('', true) | upper) ~ '_SYSTEM'), true)
+            | default('', true)
+          }}
+        dedicated_hana_sidadm_password: >-
+          {{
+            lookup('env', (staging_customer | default('', true) | upper) ~ '-HANA-' ~ (sap_sid | default('', true) | upper) ~ '-SIDADM')
+            | default(lookup('env', (staging_customer | default('', true) | upper) ~ '_HANA_' ~ (sap_sid | default('', true) | upper) ~ '_SIDADM'), true)
+            | default('', true)
+          }}
+        dedicated_hana_sapadm_password: >-
+          {{
+            lookup('env', (staging_customer | default('', true) | upper) ~ '-HANA-' ~ (sap_sid | default('', true) | upper) ~ '-SAPADM')
+            | default(lookup('env', (staging_customer | default('', true) | upper) ~ '_HANA_' ~ (sap_sid | default('', true) | upper) ~ '_SAPADM'), true)
+            | default('', true)
+          }}
+        dedicated_hana_root_password: >-
+          {{
+            lookup('env', (staging_customer | default('', true) | upper) ~ '-HANA-' ~ (sap_sid | default('', true) | upper) ~ '-ROOT')
+            | default(lookup('env', (staging_customer | default('', true) | upper) ~ '_HANA_' ~ (sap_sid | default('', true) | upper) ~ '_ROOT'), true)
+            | default('', true)
+          }}
+      no_log: true
+      when:
+        - do_hana | bool
+        - not (_is_shared_hana_host | default(false) | bool)
+        - not (is_netweaver | default(false))
+
+    - name: "Initialize shared HANA update workflow state"
+      set_fact:
+        hana_backup_status: "SKIPPED"
+        hana_backup_error: ""
+        hana_backup_details: ""
+        hana_update_status: "SKIPPED"
+        hana_update_error: ""
+        root_keys_status: "SKIPPED"
+        hana_auth_available: false
+        hana_key_preexisting: true
+        hana_maintenance_key_ok: false
+        shared_hana_instance_update_results: []
+        shared_hana_halt_remaining_updates: false
+        shared_hana_halt_remaining_updates_reason: ""
+        shared_hana_last_post_failure_health_check: {}
+      when:
+        - _is_shared_hana_host | default(false) | bool
+        - do_hana | bool
+
+    - name: "Run HANA server update workflow"
+      block:
+        - name: "Inject HANA update failure"
+          fail:
+            msg: "Injected HANA update failure for rescue path validation."
+          when: inject_failure_hana | bool
+
+        - name: "Ensure HANA is available for backup and update"
+          sap.sap_operations.system:
+            instance_number: "{{ sap_info.instances[0].mSystemNumber }}"
+            state: started
+            wait: true
+            wait_timeout: "{{ sap_start_timeout_seconds }}"
+          when:
+            - do_hana | bool
+            - not (is_netweaver | default(false))
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        # ------------------------------------------------------------------
+        # 1. HANA AUTHENTICATION: Detect existing hdbuserstore keys
+        # ------------------------------------------------------------------
+        # HANA authentication uses the hdbuserstore, which stores named
+        # connection keys (alias → host:port + user/password).
+        #
+        # Authentication priority (try in order, use first that works):
+        #   1. DEFAULT key — standard operational key, preferred if available
+        #   2. SYSTEM key  — alternative operational key
+        #   3. MAINTENANCE key — created temporarily by this playbook
+        #      using the inventory-derived SYSTEM credential from the secret store
+        #
+        # If neither DEFAULT nor SYSTEM key works, we need to:
+        #   a) Create a temporary _ADMIN_TMP key (via inventory-derived admin credential)
+        #   b) Activate the SYSTEM user (may be deactivated — SAP best practice)
+        #   c) Create the MAINTENANCE key with SYSTEM credentials
+        #   d) Remove _ADMIN_TMP immediately (security: minimize key lifetime)
+        # ------------------------------------------------------------------
+        - name: "Detect existing hdbuserstore key"
+          block:
+            # Test DEFAULT first — this is the preferred operational key.
+            # "SELECT 'OK' FROM DUMMY" is the standard HANA connectivity test.
+            - name: "Test hdbuserstore key DEFAULT"
+              shell: |
+                su - {{ sap_sid | lower }}adm -c \
+                  "hdbsql -U DEFAULT -jaxC \"SELECT 'OK' FROM DUMMY\"" 2>&1
+              register: hdb_test_default
+              changed_when: false
+              failed_when: false
+
+            # Only test SYSTEM key if DEFAULT didn't work (short-circuit)
+            - name: "Test hdbuserstore key SYSTEM"
+              shell: |
+                su - {{ sap_sid | lower }}adm -c \
+                  "hdbsql -U SYSTEM -jaxC \"SELECT 'OK' FROM DUMMY\"" 2>&1
+              register: hdb_test_system
+              changed_when: false
+              failed_when: false
+              when: "'OK' not in (hdb_test_default.stdout | default(''))"
+
+            # Determine which key to use for all subsequent HANA operations.
+            # hana_key_preexisting=true means we can skip MAINTENANCE key creation.
+            - name: "Set HANA authentication method"
+              set_fact:
+                hana_userstore_key: "{% if 'OK' in (hdb_test_default.stdout | default('')) %}DEFAULT{% elif 'OK' in (hdb_test_system.stdout | default('')) %}SYSTEM{% else %}MAINTENANCE{% endif %}"
+                hana_key_preexisting: "{{ 'OK' in (hdb_test_default.stdout | default('')) or 'OK' in (hdb_test_system.stdout | default('')) }}"
+          when: not (_is_shared_hana_host | default(false) | bool)
+
+        # ------------------------------------------------------------------
+        # 1b. Create MAINTENANCE key (when no preexisting key works)
+        # ------------------------------------------------------------------
+        # The SYSTEM user may be deactivated (SAP security best practice).
+        # We use a separate configurable HANA admin user with elevated privileges
+        # to activate SYSTEM first, then create the MAINTENANCE key with
+        # SYSTEM credentials. The _ADMIN_TMP key is removed immediately
+        # after use to minimize the attack surface.
+        # ------------------------------------------------------------------
+        - name: "Activate SYSTEM user via HANA admin user"
+          block:
+            - name: "Create temporary admin hdbuserstore key"
+              sap.sap_operations.hdbuserstore:
+                key: _ADMIN_TMP
+                env: "localhost:3{{ anchor_instance_nr }}13"
+                username: "{{ dedicated_hana_admin_user }}"
+                password: "{{ dedicated_hana_admin_password }}"
+                force: true
+              become_user: "{{ sap_sid | lower }}adm"
+              become_flags: -i
+              no_log: true
+              vars:
+                ansible_python_interpreter: "/usr/libexec/platform-python -E"
+
+            - name: "Activate SYSTEM user via admin key"
+              shell: |
+                export PATH="/usr/sap/{{ sap_sid }}/HDB{{ anchor_instance_nr }}/exe:$PATH"
+                hdbsql -U _ADMIN_TMP -d SYSTEMDB "ALTER USER SYSTEM ACTIVATE USER NOW" 2>&1
+              become_user: "{{ sap_sid | lower }}adm"
+              register: system_activate_result
+              changed_when: true
+              failed_when: false
+              no_log: true
+
+            - name: "Remove temporary admin hdbuserstore key"
+              sap.sap_operations.hdbuserstore:
+                key: _ADMIN_TMP
+                state: absent
+              become_user: "{{ sap_sid | lower }}adm"
+              become_flags: -i
+              vars:
+                ansible_python_interpreter: "/usr/libexec/platform-python -E"
+              ignore_errors: true
+          when:
+            - not (_is_shared_hana_host | default(false) | bool)
+            - not (hana_key_preexisting | default(false) | bool)
+            - (dedicated_hana_admin_password | default('') | length) > 0
+
+        - name: "Create hdbuserstore MAINTENANCE key"
+          block:
+            - name: "Create hdbuserstore key MAINTENANCE"
+              sap.sap_operations.hdbuserstore:
+                key: MAINTENANCE
+                env: "localhost:3{{ anchor_instance_nr }}13"
+                username: SYSTEM
+                password: "{{ dedicated_hana_system_user_password }}"
+                force: true
+              become_user: "{{ sap_sid | lower }}adm"
+              become_flags: -i
+              no_log: true
+              vars:
+                ansible_python_interpreter: "/usr/libexec/platform-python -E"
+
+            - name: "Verify MAINTENANCE key works"
+              shell: |
+                su - {{ sap_sid | lower }}adm -c \
+                  "hdbsql -U MAINTENANCE -jaxC \"SELECT 'OK' FROM DUMMY\"" 2>&1
+              register: maintenance_key_verify
+              changed_when: false
+              failed_when: false
+
+            - name: "Set MAINTENANCE key status"
+              set_fact:
+                hana_maintenance_key_ok: "{{ 'OK' in (maintenance_key_verify.stdout | default('')) }}"
+          rescue:
+            - name: "Mark MAINTENANCE key as failed"
+              set_fact:
+                hana_maintenance_key_ok: false
+            - name: "Abort HANA maintenance key rescue"
+              fail:
+                msg: >-
+                  Task "{{ ansible_failed_task.name | default('Unknown task') }}" failed:
+                  {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown error'))) }}
+                  Restart outcome: not attempted.
+          when:
+            - not (_is_shared_hana_host | default(false) | bool)
+            - not (hana_key_preexisting | default(false) | bool)
+            - (dedicated_hana_system_user_password | default('') | length) > 0
+
+        - name: "Set HANA auth availability"
+          set_fact:
+            hana_auth_available: "{{ (hana_key_preexisting | default(false) | bool) or (hana_maintenance_key_ok | default(false) | bool) }}"
+          when: not (_is_shared_hana_host | default(false) | bool)
+
+        # ------------------------------------------------------------------
+        # 2. SYSTEM USER ACTIVATE (if preexisting key, still activate)
+        # ------------------------------------------------------------------
+        - name: "Activate SYSTEM user via preexisting key"
+          shell: |
+            su - {{ sap_sid | lower }}adm -c \
+              "hdbsql -U {{ hana_userstore_key }} -d SYSTEMDB \
+               \"ALTER USER SYSTEM ACTIVATE USER NOW\"" 2>&1
+          register: system_activate_preexisting
+          changed_when: true
+          failed_when: false
+          no_log: true
+          when:
+            - not (_is_shared_hana_host | default(false) | bool)
+            - hana_key_preexisting | default(false) | bool
+            - hana_auth_available | default(false) | bool
+
+        # ------------------------------------------------------------------
+        # 3. HANA BACKUP: SYSTEMDB + all Tenant Databases
+        # ------------------------------------------------------------------
+        - name: "HANA Backup (SYSTEMDB + Tenants)"
+          block:
+            - name: "Discover tenant databases"
+              shell: |
+                su - {{ sap_sid | lower }}adm -c \
+                  "hdbsql -U {{ hana_userstore_key }} -d SYSTEMDB -jaxC \
+                   \"SELECT DATABASE_NAME FROM SYS_DATABASES.M_DATABASES WHERE ACTIVE_STATUS = 'YES'\""
+              register: hana_tenant_list
+              changed_when: false
+              failed_when: false
+
+            - name: "Parse tenant database list"
+              set_fact:
+                hana_databases: "{{ hana_tenant_list.stdout_lines | default([]) | select() | list }}"
+
+            - name: "Display databases to backup"
+              debug:
+                msg: "Databases found: {{ hana_databases }}"
+
+            - name: "Run HANA Backup for each database"
+              shell: |
+                su - {{ sap_sid | lower }}adm -c \
+                  "hdbsql -U {{ hana_userstore_key }} -d {{ item }} \
+                   \"BACKUP DATA USING FILE ('{{ sap_sid }}_{{ item }}_pre_update_{{ ansible_date_time.iso8601_basic_short }}')\""
+              loop: "{{ hana_databases }}"
+              loop_control:
+                label: "Backup {{ item }}"
+              register: hana_backup_results
+              no_log: true
+
+            - name: "Set backup status"
+              set_fact:
+                hana_backup_status: "{{ 'SUCCESS' if (hana_backup_results.results | rejectattr('rc', 'equalto', 0) | list | length == 0) else 'FAILED' }}"
+                hana_backup_error: "{{ hana_backup_results.results | selectattr('rc', 'greaterthan', 0) | map(attribute='stderr') | list | join('; ') }}"
+                hana_backup_details: "{{ hana_databases | join(', ') }}"
+          rescue:
+            - name: "Mark backup as failed"
+              set_fact:
+                hana_backup_status: "FAILED"
+                hana_backup_error: "{{ ansible_failed_result.msg | default('Unknown backup error') }}"
+                hana_backup_details: ""
+            - name: "Abort HANA backup rescue"
+              fail:
+                msg: >-
+                  Task "{{ ansible_failed_task.name | default('Unknown task') }}" failed:
+                  {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown error'))) }}
+                  Restart outcome: not attempted.
+          when: hana_auth_available | default(false) | bool
+
+        - name: "Fail if HANA backup failed"
+          fail:
+            msg: "{{ hana_backup_error | default('HANA backup failed') }}"
+          when:
+            - hana_auth_available | default(false) | bool
+            - hana_backup_status | default('') == 'FAILED'
+
+        # ------------------------------------------------------------------
+        # 4. PRE-FLIGHT CHECKS + HANA UPDATE
+        # ------------------------------------------------------------------
+        - name: "Pre-Flight Disk Space Check for HANA Update"
+          include_tasks: tasks/preflight_disk_check.yml
+          vars:
+            preflight_disk_profiles:
+              - hana
+              
+        - name: "Validate HANA Update Medium"
+          block:
+            - name: "Find hdblcm in HANA staging directory"
+              find:
+                paths: "{{ hana_staging_path }}"
+                patterns: "hdblcm"
+                recurse: true
+                file_type: file
+              register: hdblcm_search
+              become: true
+
+            - name: "Set HANA update component medium path"
+              set_fact:
+                hana_update_medium_detected: "{{ hdblcm_search.files[0].path | dirname }}"
+              when: hdblcm_search.matched > 0
+
+            - name: "Fail if HANA update medium not found"
+              fail:
+                msg: "hdblcm not found under {{ hana_staging_path }}"
+              when: hdblcm_search.matched == 0
+
+        - name: "Run shared HANA instance update workflow"
+          include_tasks: tasks/shared_hana_update_instance.yml
+          loop: "{{ shared_hana_instance_contexts | default([]) }}"
+          loop_control:
+            loop_var: shared_hana_instance_ctx
+            label: "{{ shared_hana_instance_ctx.instance_name }}"
+          when:
+            - _is_shared_hana_host | default(false) | bool
+            - do_hana | bool
+            - hana_update_medium_detected is defined
+
+        - name: "Summarize shared HANA instance update workflow"
+          set_fact:
+            hana_update_status: >-
+              {{
+                'FAILED'
+                if (
+                  (shared_hana_instance_update_results | default([]) | selectattr('status', 'equalto', 'FAILED') | list | length) > 0
+                  or
+                  (shared_hana_instance_update_results | default([]) | selectattr('status', 'equalto', 'HALTED') | list | length) > 0
+                )
+                else 'SUCCESS'
+              }}
+            hana_update_error: >-
+              {%- set failed = shared_hana_instance_update_results | default([]) | selectattr('status', 'equalto', 'FAILED') | list -%}
+              {%- set halted = shared_hana_instance_update_results | default([]) | selectattr('status', 'equalto', 'HALTED') | list -%}
+              {%- if (failed | length) == 0 and (halted | length) == 0 -%}
+              
+              {%- else -%}
+              Shared HANA instance update failures on {{ inventory_hostname }}:
+              {%- for item in failed -%}
+              {{ item.instance_name }} (HDB{{ item.instance_nr }}): {{ item.error }}{% if item.health_check is defined and item.health_check.status is defined %} [post-failure host health={{ item.health_check.status }}]{% endif %}{% if not loop.last or (halted | length) > 0 %}; {% endif %}
+              {%- endfor -%}
+              {%- if (halted | length) > 0 -%}
+              Remaining instances halted by shared-host health gate: {{ halted | map(attribute='instance_name') | join(', ') }}
+              {%- endif -%}
+              {%- endif -%}
+          when:
+            - _is_shared_hana_host | default(false) | bool
+            - do_hana | bool
+
+        - name: "Fail when shared HANA instance updates were not fully successful"
+          fail:
+            msg: "{{ hana_update_error }}"
+          when:
+            - _is_shared_hana_host | default(false) | bool
+            - do_hana | bool
+            - hana_update_status | default('SKIPPED') == 'FAILED'
+
+        - name: "HANA Update"
+          include_role:
+            name: sap.sap_operations.hana_update
+          vars:
+            hana_update_sid: "{{ sap_sid }}"
+            hana_update_component_medium: "{{ hana_update_medium_detected }}"
+            hana_update_password: "{{ dedicated_hana_sidadm_password }}"
+            hana_update_sapadm_password: "{{ dedicated_hana_sapadm_password }}"
+            hana_update_system_user_password: "{{ dedicated_hana_system_user_password }}"
+            hana_update_root_password: "{{ dedicated_hana_root_password }}"
+            hana_update_options:
+              components: server
+          when:
+            - hana_update_medium_detected is defined
+            - (dedicated_hana_sidadm_password | default('') | length) > 0
+            - (dedicated_hana_sapadm_password | default('') | length) > 0
+            - (dedicated_hana_system_user_password | default('') | length) > 0
+            - (dedicated_hana_root_password | default('') | length) > 0
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Mark HANA update as successful"
+          set_fact:
+            hana_update_status: "SUCCESS"
+            hana_update_error: ""
+          when:
+            - hana_update_medium_detected is defined
+            - (dedicated_hana_sidadm_password | default('') | length) > 0
+            - (dedicated_hana_sapadm_password | default('') | length) > 0
+            - (dedicated_hana_system_user_password | default('') | length) > 0
+            - (dedicated_hana_root_password | default('') | length) > 0
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        # ------------------------------------------------------------------
+        # 5. ENCRYPTION ROOT KEYS
+        # ------------------------------------------------------------------
+        - name: "Set Encryption Root Keys Backup Password"
+          block:
+            - name: "Set Root Keys Backup Password"
+              shell: |
+                su - {{ sap_sid | lower }}adm -c \
+                  "hdbsql -U {{ hana_userstore_key }} \
+                   \"ALTER SYSTEM SET ENCRYPTION ROOT KEYS BACKUP PASSWORD '{{ dedicated_hana_system_user_password }}'\""
+              no_log: true
+              register: root_keys_result
+
+            - name: "Verify Root Keys Backup Password Set"
+              shell: |
+                su - {{ sap_sid | lower }}adm -c \
+                  "hdbsql -U {{ hana_userstore_key }} -jaxC \
+                   \"SELECT IS_ROOT_KEY_BACKUP_PASSWORD_SET FROM M_BACKUP_CONFIGURATION\""
+              register: root_keys_verify
+
+            - name: "Save Root Keys Status"
+              set_fact:
+                root_keys_status: "{{ 'SET' if 'TRUE' in (root_keys_verify.stdout | default('')) else 'FAILED' }}"
+          when: do_root_keys | bool and (hana_auth_available | default(false) | bool)
+          ignore_errors: true
+      rescue:
+        - name: "Capture HANA server failure context"
+          set_fact:
+            _hana_server_stage_failed: true
+            _hana_server_error_task: "{{ ansible_failed_task.name | default('Unknown task') }}"
+            _hana_server_error_message: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown error'))) }}"
+            _hana_server_error_details: "{{ ansible_failed_result | default({}) | to_nice_yaml }}"
+            hana_update_status: "FAILED"
+            hana_update_error: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown error'))) }}"
+        - name: "Send HANA server failure notification"
+          include_tasks: tasks/send_error_notification.yml
+          vars:
+            _error_stage: "HANA Update"
+            _error_task: "{{ _hana_server_error_task }}"
+            _error_host: "{{ inventory_hostname }}"
+            _error_message: >-
+              Task "{{ _hana_server_error_task }}" failed: {{ _hana_server_error_message }}
+              Restart outcome: not attempted; downstream restart stages are blocked.
+            _error_details: "{{ _hana_server_error_details }}"
+      always:
+        # ------------------------------------------------------------------
+        # 6. DEACTIVATE SYSTEM USER (Security Best Practice)
+        # ------------------------------------------------------------------
+        # HANA SYSTEM user should be deactivated after maintenance to prevent
+        # unauthorized access. This runs in the always-section so it executes
+        # regardless of update success/failure.
+        # ------------------------------------------------------------------
+        - name: "Deactivate SYSTEM user"
+          shell: |
+            su - {{ sap_sid | lower }}adm -c \
+              "hdbsql -U {{ hana_userstore_key }} -d SYSTEMDB \
+               \"ALTER USER SYSTEM DEACTIVATE USER NOW\"" 2>&1
+          register: system_deactivate_result
+          changed_when: true
+          failed_when: false
+          no_log: true
+          when:
+            - hana_auth_available | default(false) | bool
+
+        # ------------------------------------------------------------------
+        # 7. REMOVE MAINTENANCE KEY + CLEANUP
+        # ------------------------------------------------------------------
+        # Only remove the MAINTENANCE key if it was created by this playbook
+        # (not if a preexisting DEFAULT/SYSTEM key was used). This prevents
+        # accidentally deleting customer-managed keys.
+        # ------------------------------------------------------------------
+        - name: "Remove MAINTENANCE hdbuserstore key"
+          sap.sap_operations.hdbuserstore:
+            key: MAINTENANCE
+            state: absent
+          become_user: "{{ sap_sid | lower }}adm"
+          become_flags: -i
+          vars:
+            ansible_python_interpreter: "/usr/libexec/platform-python -E"
+          when:
+            - not (hana_key_preexisting | default(false) | bool)
+            - hana_maintenance_key_ok | default(false) | bool
+          ignore_errors: true
+
+        - name: "Cleanup HANA Update staging directory"
+          file:
+            path: "{{ hana_staging_path }}"
+            state: absent
+          when: hana_update_medium_detected is defined
+
+        # ------------------------------------------------------------------
+        # STATE PERSISTENCE
+        # ------------------------------------------------------------------
+        # Persist all HANA maintenance results as a JSON file on the Ansible
+        # controller. This state is read by the validation playbook and the
+        # maintenance_report.j2 template to render the final report.
+        # ------------------------------------------------------------------
+        - name: "Save HANA Maintenance State to File"
+          copy:
+            content: |-
+              {{ {
+                'hana_backup_status': hana_backup_status | default('SKIPPED'),
+                'hana_backup_error': hana_backup_error | default(''),
+                'hana_backup_databases': hana_backup_details | default(''),
+                'hana_update': hana_update_status | default('SKIPPED'),
+                'hana_update_error': hana_update_error | default(''),
+                'root_keys': root_keys_status | default('SKIPPED'),
+                'system_user_deactivated': (system_deactivate_result.rc | default(-1) == 0) if system_deactivate_result is defined else false,
+                'maintenance_key_removed': not (hana_key_preexisting | default(false) | bool),
+                'shared_hana_instance_results': shared_hana_instance_update_results | default([]),
+                'shared_hana_halt_remaining_updates': shared_hana_halt_remaining_updates | default(false),
+                'shared_hana_halt_remaining_updates_reason': shared_hana_halt_remaining_updates_reason | default('')
+              } | to_json }}
+            dest: "{{ _state_dir }}/hana_state_{{ inventory_hostname }}.json"
+          delegate_to: localhost
+
+# ============================================================================
+# Play 2: HANA Client Update on Application Servers (via hdbinst)
+# ============================================================================
+# Updates the HANA database client on NetWeaver application servers using
+# hdbinst (not hdblcm, which requires an HDB instance).
+# SAP documentation: ./hdbinst [-a client] [<option list>]
+# Wrapped in block/rescue so failures trigger notification and abort the stage.
+# ============================================================================
+- name: "SAP Maintenance: HANA Client Update on App Servers"
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    do_hana: false
+    hana_client_staging_path: "{{ remote_hana_staging_dir | default('/usr/sap/tmp/staging') }}/hana_client"
+
+  vars_files:
+    - ../vars/common.yml
+
+  tasks:
+    - name: "Run shared SAP discovery"
+      include_tasks: tasks/discover_sap_facts.yml
+
+    - name: "Skip non-NetWeaver hosts"
+      meta: end_host
+      when: not (is_netweaver | default(false))
+
+    - name: "Skip if HANA update not requested"
+      meta: end_host
+      when: not (do_hana | bool)
+
+    - name: "Ensure run-scoped state directory exists"
+      include_tasks: tasks/create_state_directory.yml
+
+    - name: "HANA Client Update via hdbinst"
+      block:
+        - name: "Check HANA Client staging directory exists"
+          stat:
+            path: "{{ hana_client_staging_path }}"
+          register: hana_client_staging_stat
+
+        - name: "Skip if no HANA Client staged"
+          meta: end_host
+          when: not (hana_client_staging_stat.stat.exists | default(false))
+
+        - name: "Find hdbinst in HANA Client staging"
+          find:
+            paths: "{{ hana_client_staging_path }}"
+            patterns: "hdbinst"
+            recurse: true
+            file_type: file
+          register: hdbinst_search
+
+        - name: "Fail if hdbinst not found"
+          fail:
+            msg: "hdbinst not found under {{ hana_client_staging_path }}"
+          when: hdbinst_search.matched == 0
+
+        - name: "Get current HANA Client version"
+          shell: >
+            /usr/sap/{{ sap_sid }}/hdbclient/hdbsql -v 2>/dev/null
+            | grep -oP 'version:\s*\K[0-9.]+'
+          register: hana_client_ver_before
+          changed_when: false
+          failed_when: false
+
+        - name: "Run hdbinst to update HANA Client"
+          shell: |
+            {{ hdbinst_search.files[0].path }} \
+              -a client \
+              --path=/usr/sap/{{ sap_sid }}/hdbclient \
+              --batch 2>&1
+          register: hdbinst_result
+          become: true
+
+        - name: "Get HANA Client version after update"
+          shell: >
+            /usr/sap/{{ sap_sid }}/hdbclient/hdbsql -v 2>/dev/null
+            | grep -oP 'version:\s*\K[0-9.]+'
+          register: hana_client_ver_after
+          changed_when: false
+          failed_when: false
+
+        - name: "Set HANA Client update status"
+          set_fact:
+            hana_client_update_status: "SUCCESS"
+            hana_client_update_error: ""
+            hana_client_version_before: "{{ hana_client_ver_before.stdout | default('N/A') }}"
+            hana_client_version_after: "{{ hana_client_ver_after.stdout | default('N/A') }}"
+
+      rescue:
+        - name: "Mark HANA Client update as failed"
+          set_fact:
+            hana_client_update_status: "FAILED"
+            hana_client_update_error: "{{ ansible_failed_result.msg | default(hdbinst_result.stdout | default('Unknown error')) }}"
+            hana_client_version_before: "{{ hana_client_ver_before.stdout | default('N/A') if hana_client_ver_before is defined else 'N/A' }}"
+            hana_client_version_after: "N/A"
+            _hana_client_stage_failed: true
+            _hana_client_error_task: "{{ ansible_failed_task.name | default('Unknown task') }}"
+            _hana_client_error_message: "{{ ansible_failed_result.msg | default(hdbinst_result.stdout | default('Unknown error')) }}"
+            _hana_client_error_details: "{{ ansible_failed_result | default({}) | to_nice_yaml }}"
+        - name: "Send HANA client failure notification"
+          include_tasks: tasks/send_error_notification.yml
+          vars:
+            _error_stage: "HANA Update"
+            _error_task: "{{ _hana_client_error_task }}"
+            _error_host: "{{ inventory_hostname }}"
+            _error_message: >-
+              Task "{{ _hana_client_error_task }}" failed: {{ _hana_client_error_message }}
+              Restart outcome: not attempted; downstream restart stages are blocked.
+            _error_details: "{{ _hana_client_error_details }}"
+      always:
+        - name: "Save HANA Client Update State"
+          copy:
+            content: |-
+              {{ {
+                'hana_client_update': hana_client_update_status | default('SKIPPED'),
+                'hana_client_error': hana_client_update_error | default(''),
+                'hana_client_version_before': hana_client_version_before | default('N/A'),
+                'hana_client_version_after': hana_client_version_after | default('N/A'),
+              } | to_json }}
+            dest: "{{ _state_dir }}/hana_client_state_{{ inventory_hostname }}.json"
+          delegate_to: localhost
+          when: hana_client_update_status is defined
+
+        - name: "Cleanup HANA Client staging directory"
+          file:
+            path: "{{ hana_client_staging_path }}"
+            state: absent
+          ignore_errors: true
+
+# ============================================================================

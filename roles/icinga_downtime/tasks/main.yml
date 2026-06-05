@@ -1,0 +1,187 @@
+---
+# ============================================================================
+# Icinga Downtime Role - Host and shared-HANA SID downtime
+# ============================================================================
+# Dedicated systems keep the historical host-level downtime behaviour.
+# Shared HANA hosts resolve per-SID service downtimes using explicit tenant
+# mappings first and Icinga API auto-discovery as a fallback.
+#
+# Usage:
+#   icinga_action: set | remove
+#   icinga_duration: seconds (from pipeline parameter downtime_duration_minutes * 60)
+# ============================================================================
+
+- name: "Validate required Icinga variables"
+  ansible.builtin.assert:
+    that:
+      - icinga_url is defined
+      - icinga_user is defined
+      - icinga_password is defined
+      - icinga_action in ['set', 'remove']
+      - (icinga_duration | int) > 0
+    quiet: true
+
+- name: "Define consistent Downtime Author"
+  ansible.builtin.set_fact:
+    current_downtime_author: "Ansible_Automation_{{ icinga_user }}"
+
+- name: "Detect shared HANA per-SID downtime mode"
+  ansible.builtin.set_fact:
+    _icinga_use_shared_sid_downtime: "{{ (hana_shared | default(false) | bool) and ((hana_instances | default([])) | length > 0) }}"
+
+- name: "Initialize shared HANA downtime facts"
+  ansible.builtin.set_fact:
+    _icinga_shared_sid_contexts: []
+    _icinga_shared_sid_discovery_plan: []
+    icinga_service_downtime_targets: []
+    icinga_service_downtime_hosts: []
+    icinga_unresolved_shared_sids: []
+
+- name: "Build shared HANA downtime contexts"
+  ansible.builtin.set_fact:
+    _icinga_shared_sid_contexts: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for instance in hana_instances | default([]) -%}
+        {%- for tenant in instance.tenants | default([]) -%}
+          {%- set ns.items = ns.items + [
+            {
+              'sid': tenant.sid,
+              'customer': tenant.customer | default(''),
+              'instance_name': instance.instance_name,
+              'instance_nr': instance.instance_nr,
+              'target_hosts': (
+                tenant.app_hosts | default([]) | map('trim') | select() | unique | list
+                if ((tenant.app_hosts | default([]) | length) > 0)
+                else [inventory_hostname]
+              ),
+              'explicit_services': tenant.icinga_services | default([]) | map('trim') | select() | unique | list
+            }
+          ] -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  when: _icinga_use_shared_sid_downtime | bool
+
+- name: "Build shared HANA downtime host list"
+  ansible.builtin.set_fact:
+    icinga_service_downtime_hosts: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for ctx in _icinga_shared_sid_contexts | default([]) -%}
+        {%- for target_host in ctx.target_hosts | default([]) -%}
+          {%- if target_host not in ns.items -%}
+            {%- set ns.items = ns.items + [target_host] -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  when: _icinga_use_shared_sid_downtime | bool
+
+- name: "Build shared HANA Icinga discovery plan"
+  ansible.builtin.set_fact:
+    _icinga_shared_sid_discovery_plan: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for ctx in _icinga_shared_sid_contexts | default([]) -%}
+        {%- if (ctx.explicit_services | default([]) | length) == 0 -%}
+          {%- for target_host in ctx.target_hosts | default([]) -%}
+            {%- set ns.items = ns.items + [ctx | combine({'target_host': target_host})] -%}
+          {%- endfor -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  when: _icinga_use_shared_sid_downtime | bool
+
+- name: "Query Icinga services for shared HANA downtime targets"
+  ansible.builtin.uri:
+    url: "{{ icinga_url }}/v1/objects/services"
+    method: POST
+    headers:
+      Accept: application/json
+      X-HTTP-Method-Override: GET
+    body_format: json
+    body:
+      filter: "host.name==\"{{ item.target_host }}\" || host.address==\"{{ hostvars[item.target_host].ansible_host | default(item.target_host) }}\""
+      attrs: ["display_name"]
+    user: "{{ icinga_user }}"
+    password: "{{ icinga_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    timeout: 30
+    status_code: [200, 404]
+  loop: "{{ _icinga_shared_sid_discovery_plan | default([]) }}"
+  loop_control:
+    label: "{{ item.sid }} -> {{ item.target_host }}"
+  register: _icinga_shared_sid_discovery_queries
+  delegate_to: localhost
+  when:
+    - _icinga_use_shared_sid_downtime | bool
+    - (_icinga_shared_sid_discovery_plan | default([]) | length) > 0
+
+- name: "Resolve shared HANA service downtime targets"
+  ansible.builtin.set_fact:
+    _icinga_shared_resolution: >-
+      {%- set ns = namespace(targets=[], unresolved_sids=[]) -%}
+      {%- for ctx in _icinga_shared_sid_contexts | default([]) -%}
+        {%- set sid_pattern = '(^|[^A-Z0-9])' ~ (ctx.sid | upper) ~ '([^A-Z0-9]|$)' -%}
+        {%- set ctx_ns = namespace(has_match=false) -%}
+        {%- for target_host in ctx.target_hosts | default([]) -%}
+          {%- set target_address = hostvars[target_host].ansible_host | default(target_host) -%}
+          {%- set host_ns = namespace(services=(ctx.explicit_services | default([]) | unique | list)) -%}
+          {%- if (host_ns.services | length) == 0 -%}
+            {%- for query in _icinga_shared_sid_discovery_queries.results | default([]) -%}
+              {%- if (query.status | default(0)) == 200 and query.item.sid == ctx.sid and query.item.target_host == target_host -%}
+                {%- for svc in query.json.results | default([]) -%}
+                  {%- set display = svc.attrs.display_name | default('') | trim -%}
+                  {%- if (display | length) > 0 and ((display | upper) | regex_search(sid_pattern)) and display not in host_ns.services -%}
+                    {%- set host_ns.services = host_ns.services + [display] -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {%- for service_name in host_ns.services -%}
+            {%- set ctx_ns.has_match = true -%}
+            {%- set ns.targets = ns.targets + [
+              {
+                'sid': ctx.sid,
+                'customer': ctx.customer,
+                'instance_name': ctx.instance_name,
+                'instance_nr': ctx.instance_nr,
+                'target_host': target_host,
+                'target_address': target_address,
+                'service_display_name': service_name,
+                'resolution': 'explicit' if ((ctx.explicit_services | default([]) | length) > 0) else 'auto'
+              }
+            ] -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- if not ctx_ns.has_match -%}
+          {%- set ns.unresolved_sids = ns.unresolved_sids + [ctx.sid] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ {'targets': ns.targets, 'unresolved_sids': ns.unresolved_sids | unique | list} }}
+  when: _icinga_use_shared_sid_downtime | bool
+
+- name: "Store shared HANA service downtime targets"
+  ansible.builtin.set_fact:
+    icinga_service_downtime_targets: "{{ _icinga_shared_resolution.targets | default([]) }}"
+    icinga_unresolved_shared_sids: "{{ _icinga_shared_resolution.unresolved_sids | default([]) }}"
+  when: _icinga_use_shared_sid_downtime | bool
+
+- name: "Warn when shared HANA SIDs have no resolved downtime services"
+  ansible.builtin.debug:
+    msg: >-
+      No Icinga service downtime targets were resolved for SID(s)
+      {{ icinga_unresolved_shared_sids | join(', ') }} on {{ inventory_hostname }}.
+      The role will skip downtime creation for those SIDs until explicit
+      mappings or matching Icinga service names are available.
+  when:
+    - _icinga_use_shared_sid_downtime | bool
+    - (icinga_unresolved_shared_sids | default([]) | length) > 0
+
+- name: "Set Icinga downtime"
+  ansible.builtin.include_tasks: set.yml
+  when: icinga_action == 'set'
+
+- name: "Remove Icinga downtime"
+  ansible.builtin.include_tasks: remove.yml
+  when: icinga_action == 'remove'

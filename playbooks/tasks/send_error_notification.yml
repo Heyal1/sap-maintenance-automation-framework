@@ -1,0 +1,153 @@
+---
+# =============================================================================
+# Shared Task: send_error_notification.yml
+# =============================================================================
+# Sends a structured error notification email when a maintenance stage fails.
+# Called from the rescue block of each maintenance playbook.
+#
+# Pipeline: error context → Markdown template → HTML conversion → email
+#
+# The action_map provides stage-specific recommended actions so that the
+# recipient immediately knows what to check (e.g. for a HANA failure:
+# check credentials, backup status, update media). This avoids generic
+# "something failed" emails and accelerates incident response.
+#
+# Required input vars: _error_stage, _error_host, _error_task,
+#                      _error_message, _error_details
+# Required from pipeline: email_recipient, pipeline_run_id
+# =============================================================================
+
+# Derive all notification context in one set_fact to minimize task count.
+# _error_notification_action_map: maps each known stage name to a list of
+# recommended follow-up actions for the admin receiving the email.
+- name: "Derive error notification context"
+  set_fact:
+    _error_notification_host: "{{ _error_host | default(inventory_hostname) }}"
+    _error_notification_task: "{{ _error_task | default('Unknown task') }}"
+    _error_notification_message: "{{ _error_message | default('Unknown error') }}"
+    _error_notification_details: "{{ _error_details | default('') }}"
+    _error_notification_timestamp: "{{ ansible_date_time.iso8601 | default(now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')) }}"
+    _error_notification_should_send: "{{ email_recipient is defined and (email_recipient | string | trim | length > 0) and (email_recipient != 'none') }}"
+    _error_notification_file_id: >-
+      {{
+        (_error_stage | default('unknown-stage') | lower | regex_replace('[^a-z0-9]+', '_') | regex_replace('(^_+|_+$)', ''))
+        ~ '_'
+        ~ (_error_host | default(inventory_hostname) | lower | regex_replace('[^a-z0-9]+', '_') | regex_replace('(^_+|_+$)', ''))
+        ~ '_'
+        ~ now(utc=true, fmt='%Y%m%dT%H%M%SZ')
+      }}
+    _error_notification_pipeline_url: >-
+      {{
+        (
+          lookup('env', 'AZURE_DEVOPS_PIPELINE_URL_BASE')
+          | default('', true)
+          | regex_replace('/+$', '')
+        )
+        ~ '/_build/results?buildId=' ~ (pipeline_run_id | string)
+        if (
+          pipeline_run_id is defined
+          and (pipeline_run_id | string | trim | length) > 0
+          and (pipeline_run_id | string) != 'local'
+          and (lookup('env', 'AZURE_DEVOPS_PIPELINE_URL_BASE') | default('', true) | length) > 0
+        )
+        else ''
+      }}
+    _error_notification_actions: >-
+      {{
+        _error_notification_action_map[_error_stage | default('default')]
+        | default(_error_notification_action_map['default'])
+      }}
+  vars:
+    _error_notification_action_map:
+      PreCheck:
+        - "Check Icinga health and the configured service exclusions"
+        - "Verify SAP discovery, credentials, and target host reachability"
+      Icinga Downtime:
+        - "Check Icinga API availability and pipeline credentials"
+        - "Verify downtime targets and requested duration"
+      Stop Applications:
+        - "Verify SAP Host Agent / SAPControl reachability on the target host"
+        - "Check whether SAP and HANA instances can be stopped cleanly"
+      OS Update:
+        - "Review package manager, reboot, and console status on the host"
+        - "Use hypervisor or serial console access if the host did not return"
+      HANA Update:
+        - "Check HANA credentials, backup status, and update media availability"
+        - "Review hdblcm, hdbinst, and hdbsql output on the affected host"
+      Kernel Update:
+        - "Verify staged kernel files and the backup path on the SAP host"
+        - "Confirm rollback result and SAP startup status after the rollback"
+      Validation:
+        - "Check Icinga health-gate results and downtime cleanup on the target host"
+        - "Verify controller-side state files, report generation, and notification inputs"
+      default:
+        - "Check the Ansible task output and pipeline logs"
+        - "Contact the SAP Basis team if the issue persists"
+
+# Render the error notification as Markdown, then convert to HTML.
+# Two-step conversion is used because:
+#   1. Markdown is easier to template (Jinja2 + Markdown = readable source)
+#   2. HTML is required for professional email rendering in Outlook/Gmail
+# The md_to_html_email.py script adds CSS styling for email clients.
+- name: "Set error notification file paths"
+  set_fact:
+    _error_notification_markdown: "/tmp/{{ _error_notification_file_id }}.md"
+    _error_notification_html: "/tmp/{{ _error_notification_file_id }}.html"
+  when: _error_notification_should_send | bool
+
+- name: "Render error notification markdown"
+  template:
+    src: "{{ playbook_dir }}/../templates/error_notification.md.j2"
+    dest: "{{ _error_notification_markdown }}"
+    mode: '0644'
+  delegate_to: localhost
+  become: false
+  vars:
+    error_type: "MAINTENANCE FAILURE"
+    error_title: "{{ _error_stage }} failed on {{ _error_notification_host }}"
+    error_host: "{{ _error_notification_host }}"
+    error_stage: "{{ _error_stage }}"
+    error_task: "{{ _error_notification_task }}"
+    error_message: "{{ _error_notification_message }}"
+    error_details: "{{ _error_notification_details }}"
+    error_timestamp: "{{ _error_notification_timestamp }}"
+    error_actions: "{{ _error_notification_actions }}"
+    error_pipeline_url: "{{ _error_notification_pipeline_url }}"
+  when: _error_notification_should_send | bool
+
+- name: "Convert error notification markdown to HTML"
+  command:
+    argv:
+      - python3
+      - "{{ playbook_dir }}/../scripts/md_to_html_email.py"
+      - "{{ _error_notification_markdown }}"
+      - "{{ _error_notification_html }}"
+      - --title
+      - "SAP Maintenance FAILED - {{ _error_stage }} - {{ _error_notification_host }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  when: _error_notification_should_send | bool
+
+- name: "Send error notification email"
+  include_role:
+    name: send_email
+  vars:
+    email_subject: "SAP Maintenance FAILED - {{ _error_stage }} - {{ _error_notification_host }}"
+    email_html_file: "{{ _error_notification_html }}"
+  when: _error_notification_should_send | bool
+
+- name: "Remove temporary error notification files"
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ _error_notification_markdown }}"
+    - "{{ _error_notification_html }}"
+  delegate_to: localhost
+  become: false
+  when: _error_notification_should_send | bool
+
+- name: "Fail maintenance stage after notification"
+  fail:
+    msg: "{{ _error_notification_message }}"

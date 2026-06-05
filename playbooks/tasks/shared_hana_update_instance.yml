@@ -1,0 +1,168 @@
+---
+# =============================================================================
+# Shared Task: shared_hana_update_instance.yml
+# =============================================================================
+# Updates one shared HANA instance and records a guarded-continue result so a
+# single instance failure does not automatically block unrelated instances.
+# =============================================================================
+
+- name: "Resolve shared HANA update context for instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    _shared_hana_instance_credentials: >-
+      {{
+        (
+          shared_hana_sid_credentials | default([])
+          | selectattr('instance_name', 'equalto', shared_hana_instance_ctx.instance_name)
+          | selectattr('instance_nr', 'equalto', shared_hana_instance_ctx.instance_nr)
+          | list
+          | first
+        ) | default({}, true)
+      }}
+    _shared_hana_instance_result_base:
+      instance_name: "{{ shared_hana_instance_ctx.instance_name }}"
+      instance_nr: "{{ shared_hana_instance_ctx.instance_nr }}"
+      instance_tier: "{{ shared_hana_instance_ctx.instance_tier | default('dev') }}"
+      tenants: "{{ shared_hana_instance_ctx.tenants | default([]) | map(attribute='sid') | list }}"
+      customers: "{{ shared_hana_instance_ctx.tenants | default([]) | map(attribute='customer') | unique | list }}"
+      status: "PENDING"
+      failed_task: ""
+      error: ""
+      health_check: {}
+
+- name: "Record halted shared HANA instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    shared_hana_instance_update_results: >-
+      {{
+        (shared_hana_instance_update_results | default([]))
+        + [
+          _shared_hana_instance_result_base | combine(
+            {
+              'status': 'HALTED',
+              'error': shared_hana_halt_remaining_updates_reason | default('Shared-host stop gate is active.'),
+              'health_check': shared_hana_last_post_failure_health_check | default({})
+            },
+            recursive=true
+          )
+        ]
+      }}
+  when: shared_hana_halt_remaining_updates | default(false) | bool
+
+- name: "Run shared HANA update workflow for instance {{ shared_hana_instance_ctx.instance_name }}"
+  block:
+    - name: "Fail when shared HANA update credentials are unavailable for instance {{ shared_hana_instance_ctx.instance_name }}"
+      fail:
+        msg: >-
+          Missing shared HANA update credentials for instance {{ shared_hana_instance_ctx.instance_name }}
+          (HDB{{ shared_hana_instance_ctx.instance_nr }}) on {{ inventory_hostname }}.
+          Resolved tenants: {{ _shared_hana_instance_result_base.tenants | join(', ') }}.
+      when: >-
+        (_shared_hana_instance_credentials | length) == 0
+        or (_shared_hana_instance_credentials.sidadm_password | default('') | length) == 0
+        or (_shared_hana_instance_credentials.sapadm_password | default('') | length) == 0
+        or (_shared_hana_instance_credentials.system_user_password | default('') | length) == 0
+        or (_shared_hana_instance_credentials.root_password | default('') | length) == 0
+
+    - name: "Ensure shared HANA instance {{ shared_hana_instance_ctx.instance_name }} is running before update"
+      sap.sap_operations.system:
+        instance_number: "{{ shared_hana_instance_ctx.instance_nr }}"
+        state: started
+        wait: true
+        wait_timeout: "{{ sap_start_timeout_seconds }}"
+
+    - name: "Run HANA update for shared instance {{ shared_hana_instance_ctx.instance_name }}"
+      include_role:
+        name: sap.sap_operations.hana_update
+      vars:
+        hana_update_sid: "{{ shared_hana_instance_ctx.instance_name }}"
+        hana_update_component_medium: "{{ hana_update_medium_detected }}"
+        hana_update_password: "{{ _shared_hana_instance_credentials.sidadm_password }}"
+        hana_update_sapadm_password: "{{ _shared_hana_instance_credentials.sapadm_password }}"
+        hana_update_system_user_password: "{{ _shared_hana_instance_credentials.system_user_password }}"
+        hana_update_root_password: "{{ _shared_hana_instance_credentials.root_password }}"
+        hana_update_options:
+          components: server
+
+    - name: "Refresh shared HANA discovery after updating instance {{ shared_hana_instance_ctx.instance_name }}"
+      sap.sap_operations.host_info:
+      register: _shared_hana_update_verification
+      failed_when: >-
+        (_shared_hana_update_verification.msg is defined and 'SOAP' in (_shared_hana_update_verification.msg | upper))
+        or (_shared_hana_update_verification.instances | default([]) | length == 0)
+
+    - name: "Verify shared HANA instance {{ shared_hana_instance_ctx.instance_name }} restarted cleanly after update"
+      assert:
+        that:
+          - (_shared_updated_db_processes | length) > 0
+          - (_shared_green_db_processes | length) == (_shared_updated_db_processes | length)
+        fail_msg: >-
+          Shared HANA instance {{ shared_hana_instance_ctx.instance_name }} (HDB{{ shared_hana_instance_ctx.instance_nr }})
+          did not reach the expected running state after update.
+      vars:
+        _shared_updated_db_instances: >-
+          {{
+            _shared_hana_update_verification.instances | default([])
+            | selectattr('mSystemNumber', 'equalto', shared_hana_instance_ctx.instance_nr)
+            | list
+          }}
+        _shared_updated_db_processes: "{{ _shared_updated_db_instances | map(attribute='ProcessList') | select('defined') | flatten | list }}"
+        _shared_green_db_processes: >-
+          {{
+            (
+              _shared_updated_db_instances
+              | map(attribute='ProcessList')
+              | select('defined')
+              | flatten
+              | selectattr('dispstatus', 'equalto', 'SAPControl-GREEN')
+              | list
+            )
+            +
+            (
+              _shared_updated_db_instances
+              | map(attribute='ProcessList')
+              | select('defined')
+              | flatten
+              | selectattr('dispstatus', 'equalto', 'GREEN')
+              | list
+            )
+          }}
+
+    - name: "Record successful shared HANA update for instance {{ shared_hana_instance_ctx.instance_name }}"
+      set_fact:
+        _shared_hana_instance_result: >-
+          {{
+            _shared_hana_instance_result_base | combine(
+              {
+                'status': 'SUCCESS'
+              },
+              recursive=true
+            )
+          }}
+  rescue:
+    - name: "Capture shared HANA update failure for instance {{ shared_hana_instance_ctx.instance_name }}"
+      set_fact:
+        _shared_hana_instance_failure_task: "{{ ansible_failed_task.name | default('Unknown task') }}"
+        _shared_hana_instance_failure_message: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown error'))) }}"
+
+    - name: "Run shared-host stop gate after failed instance {{ shared_hana_instance_ctx.instance_name }}"
+      include_tasks: tasks/shared_hana_host_health_check.yml
+
+    - name: "Record failed shared HANA update for instance {{ shared_hana_instance_ctx.instance_name }}"
+      set_fact:
+        _shared_hana_instance_result: >-
+          {{
+            _shared_hana_instance_result_base | combine(
+              {
+                'status': 'FAILED',
+                'failed_task': _shared_hana_instance_failure_task,
+                'error': _shared_hana_instance_failure_message,
+                'health_check': _shared_hana_post_failure_health_check | default({}),
+                'halt_remaining': shared_hana_halt_remaining_updates | default(false)
+              },
+              recursive=true
+            )
+          }}
+  always:
+    - name: "Persist shared HANA update result for instance {{ shared_hana_instance_ctx.instance_name }}"
+      set_fact:
+        shared_hana_instance_update_results: "{{ (shared_hana_instance_update_results | default([])) + [_shared_hana_instance_result] }}"
+  when: not (shared_hana_halt_remaining_updates | default(false) | bool)

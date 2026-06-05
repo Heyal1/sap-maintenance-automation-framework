@@ -1,0 +1,107 @@
+---
+# =============================================================================
+# Shared Task: preflight_disk_check.yml
+# =============================================================================
+# Validates free disk space for the selected maintenance profiles.
+# Default profile selection follows the active maintenance switches:
+#   - OS:      /, /var, /tmp >= 2 GB; /boot >= 500 MB
+#   - Kernel:  /usr/sap >= 1 GB
+#   - HANA:    /hana/shared >= 10 GB
+#
+# Optional input:
+#   preflight_disk_profiles: Explicit list of profiles to check
+#                            (supported: os, kernel, hana)
+# =============================================================================
+
+- name: "Determine active disk check profiles"
+  set_fact:
+    _preflight_disk_profiles: >-
+      {{
+        (
+          preflight_disk_profiles
+          if (preflight_disk_profiles is defined and (preflight_disk_profiles | length > 0))
+          else (
+            []
+            + (['os'] if (do_os_patch | default(false) | bool) else [])
+            + (['kernel'] if (do_kernel | default(false) | bool) else [])
+            + (['hana'] if (do_hana | default(false) | bool) else [])
+          )
+        ) | unique
+      }}
+
+- name: "Build disk space requirements"
+  set_fact:
+    _preflight_disk_checks: >-
+      {{
+        []
+        + ([
+          {'profile': 'os', 'path': '/', 'required_kb': 2097152, 'required_gb': 2},
+          {'profile': 'os', 'path': '/var', 'required_kb': 2097152, 'required_gb': 2},
+          {'profile': 'os', 'path': '/boot', 'required_kb': 512000, 'required_gb': 0.5},
+          {'profile': 'os', 'path': '/tmp', 'required_kb': 2097152, 'required_gb': 2}
+        ] if ('os' in _preflight_disk_profiles) else [])
+        + ([
+          {'profile': 'kernel', 'path': '/usr/sap', 'required_kb': 1048576, 'required_gb': 1}
+        ] if ('kernel' in _preflight_disk_profiles and (is_netweaver | default(false) | bool)) else [])
+        + ([
+          {'profile': 'hana', 'path': '/hana/shared', 'required_kb': 10485760, 'required_gb': 10}
+        ] if ('hana' in _preflight_disk_profiles and (is_hana | default(false) | bool)) else [])
+      }}
+
+- name: "Collect disk space facts for required paths"
+  command:
+    argv:
+      - df
+      - -Pk
+      - "{{ item.path }}"
+  loop: "{{ _preflight_disk_checks }}"
+  loop_control:
+    label: "{{ item.profile }} {{ item.path }}"
+  register: _preflight_disk_df
+  changed_when: false
+  failed_when: false
+
+- name: "Initialize disk check results"
+  set_fact:
+    preflight_disk_results: []
+
+- name: "Assemble disk check results"
+  set_fact:
+    preflight_disk_results: "{{ preflight_disk_results + [ _disk_result ] }}"
+  vars:
+    _df_fields: "{{ (item.stdout_lines | default([]) | last | default('')) | split }}"
+    _disk_result:
+      profile: "{{ item.item.profile }}"
+      path: "{{ item.item.path }}"
+      mount: "{{ (_df_fields[5] if (_df_fields | length) > 5 else item.item.path) if (item.rc | default(1)) == 0 else item.item.path }}"
+      available_kb: "{{ (_df_fields[3] | int) if ((_df_fields | length) > 3 and (item.rc | default(1)) == 0) else 0 }}"
+      available_gb: "{{ (((_df_fields[3] | int) / 1024 / 1024) | round(2)) if ((_df_fields | length) > 3 and (item.rc | default(1)) == 0) else 0 }}"
+      required_kb: "{{ item.item.required_kb }}"
+      required_gb: "{{ item.item.required_gb }}"
+      rc: "{{ item.rc | default(1) }}"
+      error: "{{ item.stderr | default('') | trim }}"
+  loop: "{{ _preflight_disk_df.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.profile }} {{ item.item.path }}"
+
+- name: "Collect disk space failures"
+  set_fact:
+    _preflight_disk_failures: "{{ _preflight_disk_failures | default([]) + [item] }}"
+  loop: "{{ preflight_disk_results | default([]) }}"
+  loop_control:
+    label: "{{ item.profile }} {{ item.path }}"
+  when:
+    - (item.rc | int) != 0 or (item.available_kb | int) < (item.required_kb | int)
+
+- name: "Fail on insufficient disk space"
+  fail:
+    msg: >-
+      Pre-flight disk check failed:
+      {% for item in _preflight_disk_failures %}
+
+      - {{ item.path }} ({{ item.profile }}):
+      Available {{ item.available_gb }} GB ({{ item.available_kb }} KB),
+      required {{ item.required_gb }} GB ({{ item.required_kb }} KB).
+      {{ ('Error: ' ~ item.error) if (item.rc | int) != 0 else '' }}
+      {% endfor %}
+  when: (_preflight_disk_failures | default([]) | length) > 0

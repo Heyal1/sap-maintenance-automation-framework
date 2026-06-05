@@ -1,0 +1,80 @@
+# =============================================================================
+# Role: icinga_service_check - Query Icinga REST API for service status
+# =============================================================================
+# Returns a list of CRITICAL/UNKNOWN services for a given host after
+# applying two layers of exclusion filters.
+#
+# Icinga service states: 0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN
+# We filter for states 2 and 3 because WARNING services are acceptable
+# during/after maintenance (e.g. brief spikes in response time).
+#
+# Exclusion is done in two passes:
+#   Pass 1: Exact name match via `rejectattr('display_name', 'in', ...)`
+#          — handles `exclude_services` (e.g. ["uptime", "ping"])
+#   Pass 2: Prefix/regex match via Jinja2 loop with `is match(prefix)`
+#          — handles `exclude_service_prefixes` (e.g. ["sap_"])
+# Two passes are needed because Ansible's `rejectattr` filter doesn't
+# support regex matching — only exact string comparison.
+#
+# Output: icinga_critical_services (list of Icinga API result objects)
+# =============================================================================
+
+- name: "Query Icinga API for services on {{ target_hostname }}"
+  uri:
+    url: "{{ icinga_url }}/v1/objects/services"
+    method: POST
+    headers:
+      Accept: "application/json"
+      X-HTTP-Method-Override: "GET"
+    body_format: json
+    body:
+      filter: "host.name==\"{{ target_hostname }}\" || host.address==\"{{ target_host_address }}\""
+      attrs: ["last_check_result", "display_name"]
+    user: "{{ icinga_user }}"
+    password: "{{ icinga_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    timeout: 30
+    status_code: [200, 404]
+  register: icinga_api_response
+  delegate_to: localhost
+  no_log: false
+
+# Pass 1: Filter for CRITICAL (2) and UNKNOWN (3) services, excluding exact
+# service name matches from exclude_services list.
+- name: "Extract critical services and apply exclusions"
+  set_fact:
+    # Build a list using Jinja2 to ensure Ansible stores it as a list, not a string.
+    icinga_critical_services: >-
+      {{
+        (
+          icinga_api_response.json.results | default([])
+          | selectattr('attrs.last_check_result', 'defined')
+          | selectattr('attrs.last_check_result.state', 'in', [2,3])
+          | rejectattr('attrs.display_name', 'in', exclude_services | default([]))
+          | list
+        ) 
+        if icinga_api_response.status == 200 
+        else []
+      }}
+
+# Pass 2: Filter out services matching prefix patterns.
+# Uses Jinja2 namespace to build the filtered list since Ansible's built-in
+# filters don't support regex-based rejection.
+- name: "Apply prefix-based service exclusions"
+  set_fact:
+    icinga_critical_services: >-
+      {%- set ns = namespace(result=[]) -%}
+      {%- for svc in icinga_critical_services -%}
+        {%- set ns_skip = namespace(val=false) -%}
+        {%- for prefix in exclude_service_prefixes -%}
+          {%- if svc.attrs.display_name is defined and svc.attrs.display_name is match(prefix) -%}
+            {%- set ns_skip.val = true -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if not ns_skip.val -%}
+          {%- set ns.result = ns.result + [svc] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.result }}
+  when: exclude_service_prefixes | default([]) | length > 0

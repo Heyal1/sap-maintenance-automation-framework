@@ -1,0 +1,123 @@
+# ============================================================================
+# Azure DevOps Pipeline: SAP Host Info - System evaluation
+# ============================================================================
+# Purpose: Scans hosts, checks SAP instances, generates status report
+# Playbook: playbooks/01_sap_host_info.yml
+# Artifacts: SAP-Host-Info (YAML report)
+# ============================================================================
+
+trigger: none
+
+pool:
+  name: 'SAP Maintenance Runner'
+
+parameters:
+  - name: customer
+    displayName: 'Customer'
+    type: string
+    default: 'DEMO'
+    values:
+      - 'DEMO'
+      - 'TENANT_A'
+      - 'TENANT_B'
+      - 'TENANT_C'
+
+  - name: environment
+    displayName: 'Environment'
+    type: string
+    default: 'DEV'
+    values:
+      - 'DEV'
+      - 'QAS'
+      - 'PRD'
+
+  - name: target_override
+    displayName: 'Host Override (optional: hostnames/IPs comma-separated)'
+    type: string
+    default: 'none'
+
+  - name: include_kernel_guide
+    displayName: 'Include SAP Kernel Download Guide in Report'
+    type: boolean
+    default: true
+
+  - name: include_hana_guide
+    displayName: 'Include HANA Update Download Guide in Report'
+    type: boolean
+    default: true
+
+  - name: compare_kernel_with_next_env
+    displayName: 'Compare Kernel with next Environment (DEV to QAS, QAS to PRD)'
+    type: boolean
+    default: false
+
+  - name: email_recipient
+    displayName: 'Email Recipient (none = no email)'
+    type: string
+    default: 'none'
+
+variables:
+  - name: ANSIBLE_FORCE_COLOR
+    value: 'true'
+  - name: ANSIBLE_LOG_PATH
+    value: $(System.DefaultWorkingDirectory)/ansible_sap_host_info.log
+  - name: PROJECT_ROOT
+    value: '$(Build.SourcesDirectory)'
+
+stages:
+  - stage: host_info
+    displayName: 'Scan Hosts'
+    jobs:
+      - job: Runhost_info
+        displayName: 'Execute host_info Playbook'
+        workspace:
+          clean: all
+        steps:
+          - bash: sudo rm -rf "$(Build.SourcesDirectory)/reports" 2>/dev/null || true
+            displayName: 'Cleanup previous report files'
+
+          - checkout: self
+            clean: true
+
+          # Run host info scan; supports target_override for ad-hoc hosts
+          - bash: |
+              LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+              OVERRIDE="${{ parameters.target_override }}"
+              if [ -n "$OVERRIDE" ] && [ "$OVERRIDE" != "none" ]; then
+                LIMIT="$OVERRIDE"
+              fi
+
+              echo "=============================================="
+              echo "SAP HOST INFO: $LIMIT"
+              echo "=============================================="
+
+              mkdir -p reports
+
+              ansible-playbook playbooks/01_sap_host_info.yml \
+                -i inventory/inventory.yml \
+                -l "$LIMIT" \
+                -e "@vars/common.yml" \
+                -e customer_name=${{ parameters.customer }} \
+                -e sap_environment=${{ parameters.environment }} \
+                -e include_kernel_guide=${{ parameters.include_kernel_guide }} \
+                -e include_hana_guide=${{ parameters.include_hana_guide }} \
+                -e compare_kernel_with_next_env=${{ parameters.compare_kernel_with_next_env }} \
+                -e "email_recipient=${{ parameters.email_recipient }}" \
+                -e "pipeline_run_id=$(Build.BuildId)" \
+                -v
+            displayName: 'Run 01_sap_host_info.yml'
+            workingDirectory: $(PROJECT_ROOT)
+
+          - task: PublishBuildArtifacts@1
+            condition: always()
+            displayName: 'Publish Ansible Log'
+            inputs:
+              PathtoPublish: '$(ANSIBLE_LOG_PATH)'
+              ArtifactName: 'Ansible-Log-SAP-Host-Info'
+
+          - task: PublishBuildArtifacts@1
+            condition: succeeded()
+            displayName: 'Publish host_info Reports'
+            inputs:
+              PathtoPublish: '$(PROJECT_ROOT)/reports'
+              ArtifactName: 'SAP-SAP-Host-Info'

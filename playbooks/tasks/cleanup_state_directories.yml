@@ -1,0 +1,48 @@
+---
+# =============================================================================
+# Shared Task: cleanup_state_directories.yml
+# =============================================================================
+# Removes expired maintenance run directories from the controller state tree.
+# A run directory has the shape <customer>/<env>/<run_id>/ and contains one or
+# more SID subdirectories below it.
+# =============================================================================
+- name: "Ensure controller state base directory exists"
+  file:
+    path: "{{ controller_state_base }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+  become: false
+
+- name: "Find expired maintenance run directories"
+  find:
+    paths: "{{ controller_state_base }}"
+    recurse: true
+    file_type: directory
+    age: "{{ state_retention_days }}d"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  register: _state_dir_candidates
+
+- name: "Select expired run directories"
+  set_fact:
+    _expired_state_run_dirs: >-
+      {{
+        _state_dir_candidates.files
+        | map(attribute='path')
+        | select('match', '^' ~ controller_state_base ~ '/[^/]+/[^/]+/[^/]+$')
+        | list
+      }}
+  run_once: true
+
+- name: "Remove expired maintenance run directories"
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ _expired_state_run_dirs }}"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  when: (_expired_state_run_dirs | default([])) | length > 0

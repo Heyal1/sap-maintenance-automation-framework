@@ -1,0 +1,29 @@
+---
+# =============================================================================
+# Shared Task: shared_hana_load_tenant_state.yml
+# =============================================================================
+# Loads one shared-host tenant state file from the controller.
+# =============================================================================
+
+- name: "Ensure shared SID state directory exists for {{ shared_hana_tenant_ctx.sid }}"
+  include_tasks: tasks/create_state_directory.yml
+  vars:
+    target_state_sid: "{{ shared_hana_tenant_ctx.sid }}"
+
+- name: "Read shared pre-maintenance state for {{ shared_hana_tenant_ctx.sid }}"
+  slurp:
+    src: "{{ _state_dir }}/instance_state.yml"
+  delegate_to: localhost
+  become: false
+  register: _shared_hana_tenant_state_raw
+  failed_when: false
+
+- name: "Fail when shared pre-maintenance state is missing for {{ shared_hana_tenant_ctx.sid }}"
+  fail:
+    msg: "Missing pre-maintenance state file at {{ _state_dir }}/instance_state.yml for shared SID {{ shared_hana_tenant_ctx.sid }} on {{ inventory_hostname }}."
+  when: _shared_hana_tenant_state_raw.content is not defined
+
+- name: "Append shared pre-maintenance state for {{ shared_hana_tenant_ctx.sid }}"
+  set_fact:
+    shared_hana_instance_tenant_states: "{{ shared_hana_instance_tenant_states + [(_shared_hana_tenant_state_raw.content | b64decode | from_yaml)] }}"
+  when: _shared_hana_tenant_state_raw.content is defined

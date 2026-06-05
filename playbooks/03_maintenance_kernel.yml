@@ -1,0 +1,156 @@
+# ============================================================================
+# SAP Maintenance: Kernel Update with Automatic Rollback
+# ============================================================================
+# Performs SAP kernel binary replacement with block/rescue rollback.
+# Stop/start is handled by the consolidated lifecycle stages.
+# On failure: removes failed kernel content, restores the backup, and defers
+# restart to the later StartApplications stage.
+# Pipeline Stage: 4. KernelUpdate
+# ============================================================================
+- name: "SAP Maintenance: Kernel Update"
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    do_kernel: false
+    do_hana: false
+    do_os_patch: false
+    inject_failure_kernel: false
+    current_backup_suffix: "{{ ansible_date_time.iso8601_basic_short }}"
+    # Staging path - matches 02_staging.yml distribution path
+    kernel_staging_path: "{{ remote_staging_dir | default('/usr/sap/tmp/staging') }}/kernel"
+    kernel_validation_executables:
+      - disp+work
+      - tp
+      - R3trans
+      - sapstartsrv
+      - sapwebdisp
+
+  vars_files:
+    - ../vars/common.yml
+
+  tasks:
+    - name: "Log active switch values"
+      include_tasks: tasks/log_switch_state.yml
+
+    - name: "Run shared SAP discovery"
+      include_tasks: tasks/discover_sap_facts.yml
+
+    - name: "Skip non-NetWeaver hosts"
+      meta: end_host
+      when: not (is_netweaver | default(false))
+
+    - name: "Set Kernel Variables"
+      set_fact:
+        sap_exe_path: "/usr/sap/{{ sap_sid }}/SYS/exe/run"
+        kernel_backup_path: "/usr/sap/{{ sap_sid }}/SYS/exe/run-{{ current_backup_suffix }}"
+
+    - name: "Ensure run-scoped state directory exists"
+      include_tasks: tasks/create_state_directory.yml
+
+    # Kernel update is intentionally binary-only here.
+    # StopApplications has already halted SAP, and StartApplications will bring
+    # it back later. This stage only backs up the current kernel, copies the
+    # staged binaries, runs saproot.sh, and verifies the expected executables.
+    - name: "Kernel Update with Rollback"
+      block:
+        - name: "Backup current SAP kernel"
+          copy:
+            src: "{{ sap_exe_path }}/"
+            dest: "{{ kernel_backup_path }}"
+            remote_src: true
+            mode: preserve
+
+        - name: "Inject kernel failure"
+          fail:
+            msg: "Injected kernel failure for rollback validation."
+          when: inject_failure_kernel | bool
+
+        - name: "Install new SAP kernel binaries"
+          copy:
+            src: "{{ kernel_staging_path }}/"
+            dest: "{{ sap_exe_path }}"
+            remote_src: true
+            mode: preserve
+          register: _kernel_update_copy
+
+        - name: "Run saproot.sh fixup script"
+          command:
+            cmd: "./saproot.sh {{ sap_sid }}"
+            chdir: "{{ sap_exe_path }}"
+          changed_when: true
+          when: _kernel_update_copy is changed
+
+        - name: "Collect kernel executable validation results"
+          stat:
+            path: "{{ sap_exe_path }}/{{ item }}"
+          loop: "{{ kernel_validation_executables }}"
+          register: _kernel_executable_stats
+
+        - name: "Validate installed kernel executables"
+          assert:
+            that:
+              - _kernel_missing_executables | length == 0
+            fail_msg: >-
+              Kernel validation failed on {{ inventory_hostname }}. Missing executables:
+              {{ _kernel_missing_executables | join(', ') }}.
+          vars:
+            _kernel_missing_executables: >-
+              {{
+                _kernel_executable_stats.results
+                | rejectattr('stat.exists', 'equalto', true)
+                | map(attribute='item')
+                | list
+              }}
+      rescue:
+        - name: "ROLLBACK: Check kernel backup availability"
+          stat:
+            path: "{{ kernel_backup_path }}"
+          register: _kernel_backup_stat
+
+        - name: "ROLLBACK: Remove failed kernel"
+          file:
+            path: "{{ sap_exe_path }}"
+            state: absent
+          when: _kernel_backup_stat.stat.isdir | default(false)
+
+        - name: "ROLLBACK: Restore from backup"
+          copy:
+            src: "{{ kernel_backup_path }}/"
+            dest: "{{ sap_exe_path }}"
+            remote_src: true
+            mode: preserve
+          when: _kernel_backup_stat.stat.isdir | default(false)
+
+        - name: "ROLLBACK: Mark completed"
+          set_fact:
+            rollback_performed: "{{ _kernel_backup_stat.stat.isdir | default(false) }}"
+            rollback_error: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('Unknown error')) }}"
+            _kernel_stage_failed: true
+            _kernel_error_task: "{{ ansible_failed_task.name | default('Unknown task') }}"
+            _kernel_error_message: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('Unknown error')) }}"
+            _kernel_error_details: |-
+              Kernel update failed{% if _kernel_backup_stat.stat.isdir | default(false) %} and rollback was executed{% else %} before a rollback backup was available{% endif %}.
+              Backup path: {{ kernel_backup_path }}
+
+              Raw task result:
+              {{ ansible_failed_result | default({}) | to_nice_yaml }}
+        - name: "Send kernel failure notification"
+          include_tasks: tasks/send_error_notification.yml
+          vars:
+            _error_stage: "Kernel Update"
+            _error_task: "{{ _kernel_error_task }}"
+            _error_host: "{{ inventory_hostname }}"
+            _error_message: >-
+              Task "{{ _kernel_error_task }}" failed: {{ _kernel_error_message }}
+              Restart outcome: {{ 'rollback executed; SAP restart deferred to a later stage.' if (_kernel_backup_stat.stat.isdir | default(false)) else 'rollback not executed because no kernel backup was available.' }}
+            _error_details: "{{ _kernel_error_details }}"
+      always:
+        # Persist kernel state as JSON for the validation playbook.
+        # Schema: {rollback: bool, backup_path: string, rollback_error: string}
+        - name: "Save Kernel State"
+          copy:
+            content: "{{ {'rollback': rollback_performed | default(false), 'backup_path': kernel_backup_path | default(sap_exe_path ~ '-' ~ current_backup_suffix), 'rollback_error': rollback_error | default('')} | to_json }}"
+            dest: "{{ _state_dir }}/kernel_state_{{ inventory_hostname }}.json"
+          delegate_to: localhost

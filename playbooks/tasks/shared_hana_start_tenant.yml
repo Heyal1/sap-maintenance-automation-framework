@@ -1,0 +1,18 @@
+---
+# =============================================================================
+# Shared Task: shared_hana_start_tenant.yml
+# =============================================================================
+# Restarts application hosts for one shared HANA tenant in recorded order.
+# =============================================================================
+
+- name: "Leave shared tenant {{ shared_hana_tenant_state.sid }} unchanged"
+  debug:
+    msg: "SID {{ shared_hana_tenant_state.sid }} on {{ inventory_hostname }} was {{ shared_hana_tenant_state.pre_maintenance_state | default('stopped') }} before maintenance. Leaving it stopped."
+  when: not (shared_hana_tenant_state.was_running | default(false) | bool)
+
+- name: "Restart shared tenant application hosts for {{ shared_hana_tenant_state.sid }}"
+  include_tasks: tasks/shared_hana_start_app_host.yml
+  loop: "{{ shared_hana_tenant_state.app_host_states | default([]) }}"
+  loop_control:
+    loop_var: shared_hana_app_host_state
+    label: "{{ shared_hana_app_host_state.host }}"

@@ -1,0 +1,78 @@
+all:
+  vars:
+    ansible_user: ansible
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_connection: ssh
+  children:
+    DEMO:
+      children:
+        DEMO_DEV:
+          hosts:
+            demo-app-01:
+              ansible_host: 192.0.2.10
+              sap_sid: D01
+              sap_sids: [D01]
+            demo-hdb-01:
+              ansible_host: 192.0.2.11
+              sap_sid: D01
+              sap_sids: [D01]
+
+    TENANT_A:
+      children:
+        TENANT_A_DEV:
+          hosts:
+            tenant-a-app-01:
+              ansible_host: 192.0.2.20
+              sap_sid: A1D
+              sap_sids: [A1D]
+
+    TENANT_B:
+      children:
+        TENANT_B_QAS:
+          hosts:
+            tenant-b-app-01:
+              ansible_host: 192.0.2.21
+              sap_sid: B1Q
+              sap_sids: [B1Q]
+
+    TENANT_C:
+      children:
+        TENANT_C_PRD:
+          hosts:
+            tenant-c-app-01:
+              ansible_host: 192.0.2.22
+              sap_sid: C1P
+              sap_sids: [C1P]
+
+    SHARED_HANA:
+      children:
+        SHARED_HANA_demohdb01:
+          hosts:
+            demohdb01:
+              ansible_host: 192.0.2.30
+              hana_shared: true
+              sap_sid: SHARED
+              sap_sids: [A1D, B1Q, C1P]
+              hana_instances:
+                - instance_nr: "01"
+                  instance_name: H01
+                  tenants:
+                    - sid: A1D
+                      customer: TENANT_A
+                      update_tier: dev
+                      app_hosts: [tenant-a-app-01]
+                      icinga_services: []
+                    - sid: B1Q
+                      customer: TENANT_B
+                      update_tier: qas
+                      app_hosts: [tenant-b-app-01]
+                      icinga_services: []
+                - instance_nr: "02"
+                  instance_name: H02
+                  tenants:
+                    - sid: C1P
+                      customer: TENANT_C
+                      update_tier: prd
+                      app_hosts: [tenant-c-app-01]
+                      icinga_services: []

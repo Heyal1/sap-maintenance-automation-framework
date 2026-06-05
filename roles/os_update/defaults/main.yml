@@ -1,0 +1,33 @@
+---
+# Default variables for os_update role
+# All variables are namespaced with 'os_update_' prefix
+
+# Shared maintenance switches keep the operator-facing toggle registry explicit.
+do_kernel: false  # Default false; do not process kernel-specific maintenance unless selected.
+do_hana: false  # Default false; do not process HANA-specific maintenance unless selected.
+do_os_patch: false  # Default false; do not trigger OS patching behavior unless selected.
+skip_icinga: false  # Default false; true bypasses Icinga checks and downtime handling.
+do_root_keys: false  # Default false; true enables HANA root key handling where supported.
+
+# Path to the log file where patch operations are logged
+# Default: /var/log/ansible_patch.log
+# In Azure DevOps pipelines, this should be set to {{ playbook_dir }}/../ansible_os_update.log
+os_update_log_file: /var/log/ansible_patch.log
+
+# List of packages to exclude from updates
+# Example: ['kernel', 'glibc']
+os_update_excluded_packages: []
+
+# Dry run mode - check for updates but don't install or reboot
+# Default: false (updates will be installed)
+os_update_dry_run: false
+
+# Whether to perform a reboot after patching
+# Default: true (reboot will be performed)
+os_update_reboot: true
+
+# Reboot timeout settings
+os_update_reboot_connect_timeout: 5
+os_update_reboot_timeout: 300
+os_update_reboot_pre_delay: 0
+os_update_reboot_post_delay: 30

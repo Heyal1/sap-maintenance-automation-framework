@@ -1,0 +1,126 @@
+---
+# =============================================================================
+# Shared Task: load_maintenance_state.yml
+# =============================================================================
+# Consolidates state from all maintenance stages into host facts.
+#
+# State files are persisted as JSON on the Ansible controller because each
+# maintenance stage runs as a separate playbook (separate Azure Pipeline step).
+# Without file-based persistence, facts set in one playbook would be lost
+# before the next playbook runs. Each stage writes its own state file:
+#
+#   kernel_state_<host>.json    — {rollback, backup_path, rollback_error}
+#   os_state_<host>.json        — {os_patch_count, os_packages_updated, ...}
+#   hana_state_<host>.json      — {hana_backup_status, hana_update, ...}
+#   hana_client_state_<host>.json — {hana_client_update, version_before/after}
+#
+# This task reads them back and sets the corresponding Ansible host facts
+# so that the validation playbook and report template can access them.
+#
+# Included by: 03_maintenance_validation.yml (Play 2)
+# =============================================================================
+
+# --- Kernel State ---
+# JSON schema: {rollback: bool, backup_path: str, rollback_error: str}
+- name: "Load Kernel state"
+  block:
+    - name: "Read Kernel state file"
+      slurp:
+        src: "{{ _state_dir }}/kernel_state_{{ inventory_hostname }}.json"
+      delegate_to: localhost
+      register: _kernel_state_raw
+      failed_when: false
+
+    - name: "Parse Kernel state"
+      set_fact:
+        rollback_performed: "{{ (_kernel_state_raw.content | b64decode | from_json).rollback | default(false) }}"
+        kernel_backup_path: "{{ (_kernel_state_raw.content | b64decode | from_json).backup_path | default('N/A') }}"
+        rollback_error: "{{ (_kernel_state_raw.content | b64decode | from_json).rollback_error | default('') }}"
+      when: _kernel_state_raw.content is defined
+  when: do_kernel | bool and (is_netweaver | default(false))
+
+# --- OS Patch State ---
+# JSON schema: {os_patch_count: int, os_packages_updated: list,
+#               os_version_before: str, os_version_after: str,
+#               reboot_performed: bool}
+- name: "Load OS Patch state"
+  block:
+    - name: "Read OS state file"
+      slurp:
+        src: "{{ _state_dir }}/os_state_{{ inventory_hostname }}.json"
+      delegate_to: localhost
+      register: _os_state_raw
+      failed_when: false
+
+    - name: "Parse OS state"
+      set_fact:
+        os_patch_count: "{{ (_os_state_raw.content | b64decode | from_json).os_patch_count | default(0) }}"
+        os_packages_updated: "{{ (_os_state_raw.content | b64decode | from_json).os_packages_updated | default([]) }}"
+        os_version_before: "{{ (_os_state_raw.content | b64decode | from_json).os_version_before | default('N/A') }}"
+        os_version_after: "{{ (_os_state_raw.content | b64decode | from_json).os_version_after | default('N/A') }}"
+        os_reboot_performed: "{{ (_os_state_raw.content | b64decode | from_json).reboot_performed | default(false) }}"
+      when: _os_state_raw.content is defined
+  when: do_os_patch | bool
+
+# --- HANA State ---
+# JSON schema: {hana_backup_status, hana_backup_error, hana_backup_databases,
+#               hana_update, hana_update_error, root_keys, system_user_deactivated,
+#               maintenance_key_removed}
+# HANA Client state (NetWeaver hosts only): {hana_client_update,
+#               hana_client_error, hana_client_version_before/after}
+- name: "Load HANA state"
+  block:
+    - name: "Read HANA state file"
+      slurp:
+        src: "{{ _state_dir }}/hana_state_{{ inventory_hostname }}.json"
+      delegate_to: localhost
+      register: _hana_state_raw
+      failed_when: false
+
+    - name: "Parse HANA state"
+      set_fact:
+        hana_backup_status: "{{ (_hana_state_raw.content | b64decode | from_json).hana_backup_status | default('SKIPPED') }}"
+        hana_backup_error: "{{ (_hana_state_raw.content | b64decode | from_json).hana_backup_error | default('') }}"
+        hana_backup_databases: "{{ (_hana_state_raw.content | b64decode | from_json).hana_backup_databases | default('') }}"
+        hana_update_status: "{{ (_hana_state_raw.content | b64decode | from_json).hana_update | default('SKIPPED') }}"
+        hana_update_error: "{{ (_hana_state_raw.content | b64decode | from_json).hana_update_error | default('') }}"
+        root_keys_status: "{{ (_hana_state_raw.content | b64decode | from_json).root_keys | default('SKIPPED') }}"
+        system_user_deactivated: "{{ (_hana_state_raw.content | b64decode | from_json).system_user_deactivated | default(false) }}"
+        maintenance_key_removed: "{{ (_hana_state_raw.content | b64decode | from_json).maintenance_key_removed | default(false) }}"
+        shared_hana_instance_results: "{{ (_hana_state_raw.content | b64decode | from_json).shared_hana_instance_results | default([]) }}"
+        shared_hana_halt_remaining_updates: "{{ (_hana_state_raw.content | b64decode | from_json).shared_hana_halt_remaining_updates | default(false) }}"
+        shared_hana_halt_remaining_updates_reason: "{{ (_hana_state_raw.content | b64decode | from_json).shared_hana_halt_remaining_updates_reason | default('') }}"
+      when: _hana_state_raw.content is defined
+
+    - name: "Read HANA Client state file"
+      slurp:
+        src: "{{ _state_dir }}/hana_client_state_{{ inventory_hostname }}.json"
+      delegate_to: localhost
+      register: _hana_client_state_raw
+      failed_when: false
+      when: is_netweaver | default(false)
+
+    - name: "Parse HANA Client state"
+      set_fact:
+        hana_client_update_status: "{{ (_hana_client_state_raw.content | b64decode | from_json).hana_client_update | default('SKIPPED') }}"
+        hana_client_update_error: "{{ (_hana_client_state_raw.content | b64decode | from_json).hana_client_error | default('') }}"
+        hana_client_version_before: "{{ (_hana_client_state_raw.content | b64decode | from_json).hana_client_version_before | default('N/A') }}"
+        hana_client_version_after: "{{ (_hana_client_state_raw.content | b64decode | from_json).hana_client_version_after | default('N/A') }}"
+      when: is_netweaver | default(false) and (_hana_client_state_raw.content is defined)
+  when: do_hana | bool
+
+# --- Shared HANA Start State ---
+- name: "Load shared HANA start state"
+  block:
+    - name: "Read shared HANA start state file"
+      slurp:
+        src: "{{ _state_dir }}/shared_hana_start_state_{{ inventory_hostname }}.json"
+      delegate_to: localhost
+      register: _shared_hana_start_state_raw
+      failed_when: false
+
+    - name: "Parse shared HANA start state"
+      set_fact:
+        shared_hana_start_results: "{{ (_shared_hana_start_state_raw.content | b64decode | from_json).shared_hana_start_results | default([]) }}"
+      when: _shared_hana_start_state_raw.content is defined
+  when: hana_shared | default(false) | bool

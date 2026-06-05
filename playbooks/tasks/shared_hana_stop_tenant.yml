@@ -1,0 +1,69 @@
+---
+# =============================================================================
+# Shared Task: shared_hana_stop_tenant.yml
+# =============================================================================
+# Persists per-SID pre-maintenance state and stops connected application hosts
+# for one tenant on a shared HANA database host.
+# =============================================================================
+
+- name: "Ensure shared SID state directory exists for {{ shared_hana_tenant_ctx.sid }}"
+  include_tasks: tasks/create_state_directory.yml
+  vars:
+    target_state_sid: "{{ shared_hana_tenant_ctx.sid }}"
+
+- name: "Initialize shared tenant app host states for {{ shared_hana_tenant_ctx.sid }}"
+  set_fact:
+    _shared_tenant_app_host_states: []
+
+- name: "Stop shared tenant application hosts for {{ shared_hana_tenant_ctx.sid }}"
+  include_tasks: tasks/shared_hana_stop_app_host.yml
+  loop: "{{ shared_hana_tenant_ctx.app_hosts | default([]) | unique | list }}"
+  loop_control:
+    loop_var: shared_hana_app_host
+    label: "{{ shared_hana_app_host }}"
+
+- name: "Derive shared tenant pre-maintenance state for {{ shared_hana_tenant_ctx.sid }}"
+  set_fact:
+    _shared_tenant_total_process_count: >-
+      {{
+        (shared_hana_instance_db_state.process_count_total | default(0) | int)
+        + ((_shared_tenant_app_host_states | default([]) | map(attribute='process_count_total') | map('int') | sum) | int)
+      }}
+    _shared_tenant_nonstopped_process_count: >-
+      {{
+        (shared_hana_instance_db_state.process_count_nonstopped | default(0) | int)
+        + ((_shared_tenant_app_host_states | default([]) | map(attribute='process_count_nonstopped') | map('int') | sum) | int)
+      }}
+    _shared_tenant_was_running: >-
+      {{
+        (shared_hana_instance_db_state.was_running | default(false) | bool)
+        or ((_shared_tenant_app_host_states | default([]) | selectattr('was_running') | list | length) > 0)
+      }}
+
+- name: "Persist shared tenant pre-maintenance state for {{ shared_hana_tenant_ctx.sid }}"
+  copy:
+    content: |-
+      {{
+        {
+          'sid': shared_hana_tenant_ctx.sid,
+          'customer': shared_hana_tenant_ctx.customer,
+          'host': inventory_hostname,
+          'hana_shared': true,
+          'component_role': 'shared_hana_tenant',
+          'recorded_at': ansible_date_time.iso8601,
+          'instance_name': shared_hana_instance_ctx.instance_name,
+          'instance_nr': shared_hana_instance_ctx.instance_nr,
+          'update_tier': shared_hana_tenant_ctx.update_tier,
+          'tier_rank': shared_hana_tenant_ctx.tier_rank | int,
+          'pre_maintenance_state': 'running' if (_shared_tenant_was_running | bool) else 'stopped',
+          'was_running': _shared_tenant_was_running | bool,
+          'process_count_total': _shared_tenant_total_process_count | int,
+          'process_count_nonstopped': _shared_tenant_nonstopped_process_count | int,
+          'database_state': shared_hana_instance_db_state,
+          'app_host_states': _shared_tenant_app_host_states | default([])
+        } | to_nice_yaml(indent=2)
+      }}
+    dest: "{{ _state_dir }}/instance_state.yml"
+    mode: '0644'
+  delegate_to: localhost
+  become: false

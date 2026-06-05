@@ -1,0 +1,291 @@
+# ============================================================================
+# SAP Maintenance: Post-Validation & Notification
+# ============================================================================
+# Play 1 (strategy: free): Parallel health polling + downtime removal per host
+# Play 2 (strategy: linear): Collect AFTER versions, load state, report, email
+#
+# Pipeline Stage: 6. ValidationNotify
+# ============================================================================
+# ============================================================================
+# Play 1: Health Gate & Downtime (parallel per host)
+# ============================================================================
+- name: "SAP Maintenance: Health Gate & Downtime"
+  hosts: all
+  gather_facts: true
+  become: true
+  # strategy:free lets each host proceed independently through the health
+  # gate polling — no host blocks another while waiting for Icinga recovery.
+  # ignore_unreachable:true prevents the play from aborting if a host is
+  # still rebooting after OS patching (it will be retried in Play 2).
+  strategy: free
+  ignore_unreachable: true
+
+  vars:
+    do_kernel: false
+    do_hana: false
+    do_os_patch: false
+    inject_failure_validation: false
+
+  vars_files:
+    - ../vars/common.yml
+
+  tasks:
+    - name: "Run validation health gate workflow"
+      block:
+        - name: "Log active switch values"
+          include_tasks: tasks/log_switch_state.yml
+
+        - name: "Run shared SAP discovery"
+          include_tasks: tasks/discover_sap_facts.yml
+
+        - name: "Run Icinga discovery"
+          include_tasks: tasks/discover_icinga_facts.yml
+          when: not (skip_icinga | default(false) | bool)
+
+        - name: "Inject validation failure"
+          fail:
+            msg: "Injected validation failure for rescue path validation."
+          when: inject_failure_validation | bool
+
+        # Poll Icinga until all services are green (or timeout)
+        - name: "Post-Validation Health Gate"
+          include_role:
+            name: icinga_service_gate
+          vars:
+            gate_poll_mode: true
+            gate_poll_interval: 60
+            gate_max_wait_seconds: "{{ icinga_post_validation_pause_seconds | default(600) }}"
+            icinga_url: "{{ icinga_api_url }}"
+            icinga_user: "{{ icinga_api_user }}"
+            icinga_password: "{{ icinga_api_pass }}"
+            exclude_services: "{{ current_exclude_services }}"
+            exclude_service_prefixes: "{{ icinga_exclude_service_prefixes | default([]) }}"
+            gate_fail_on_critical: false
+            gate_target_host: "{{ item }}"
+          loop: "{{ icinga_target_list }}"
+          loop_control:
+            label: "{{ item }}"
+          when:
+            - not (skip_icinga | default(false) | bool)
+            - icinga_target_list | length > 0
+
+        - name: "Set health status"
+          set_fact:
+            _all_hosts_healthy: "{{ (_icinga_crit_list | default([]) | length) == 0 }}"
+            icinga_critical_services: "{{ _icinga_crit_list | default([]) }}"
+            icinga_skipped: false
+            _downtime_retained: "{{ (_icinga_crit_list | default([]) | length) > 0 }}"
+          when: not (skip_icinga | default(false) | bool)
+
+        - name: "Set health status (Icinga skipped)"
+          set_fact:
+            _all_hosts_healthy: true
+            icinga_critical_services: []
+            icinga_skipped: true
+            _downtime_retained: false
+          when: skip_icinga | default(false) | bool
+
+        # Remove downtime only when ALL services on this host are healthy.
+        # If critical services remain after the polling timeout, the downtime
+        # is intentionally KEPT ACTIVE to prevent Icinga alerts from firing
+        # while the admin investigates. This is a safety measure — the downtime
+        # will eventually expire on its own if not manually removed.
+        - name: "Remove Icinga Downtime"
+          include_role:
+            name: icinga_downtime
+          vars:
+            icinga_action: "remove"
+            icinga_url: "{{ icinga_api_url }}"
+            icinga_user: "{{ icinga_api_user }}"
+            icinga_password: "{{ icinga_api_pass }}"
+          when:
+            - not (skip_icinga | default(false) | bool)
+            - (icinga_downtime_targets | default([]) | length > 0)
+            - _all_hosts_healthy | default(false) | bool
+          ignore_errors: true
+
+        - name: "WARNING: Downtime kept active"
+          debug:
+            msg: >-
+              Downtime NOT removed for {{ inventory_hostname }}.
+              {{ (_icinga_crit_list | default([]) | length) }} critical service(s) after
+              {{ icinga_post_validation_pause_seconds | default(600) }}s timeout:
+              {{ icinga_critical_services | map(attribute='attrs.display_name') | list }}.
+              Manual intervention required.
+          when:
+            - not (skip_icinga | default(false) | bool)
+            - not (_all_hosts_healthy | default(false) | bool)
+      rescue:
+        - name: "Capture validation failure context"
+          set_fact:
+            _validation_stage_failed: true
+            _validation_error_task: "{{ ansible_failed_task.name | default('Unknown task') }}"
+            _validation_error_message: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown error'))) }}"
+            _validation_error_details: "{{ ansible_failed_result | default({}) | to_nice_yaml }}"
+        - name: "Send validation failure notification"
+          include_tasks: tasks/send_error_notification.yml
+          vars:
+            _error_stage: "Validation"
+            _error_task: "{{ _validation_error_task }}"
+            _error_host: "{{ inventory_hostname }}"
+            _error_message: >-
+              Task "{{ _validation_error_task }}" failed: {{ _validation_error_message }}
+              Restart outcome: validation stage failed before completion.
+            _error_details: "{{ _validation_error_details }}"
+
+# ============================================================================
+# Play 2: Version Collection, Report & Notification
+# ============================================================================
+- name: "SAP Maintenance: Report & Notification"
+  hosts: all
+  gather_facts: true
+  become: true
+  ignore_unreachable: true
+
+  vars:
+    do_kernel: false
+    do_hana: false
+    do_os_patch: false
+    email_recipient: ""
+    inject_failure_validation: false
+    _state_prefix: "{{ staging_customer | default('UNKNOWN') }}_{{ staging_environment | default('UNKNOWN') }}"
+
+  vars_files:
+    - ../vars/common.yml
+
+  tasks:
+    - name: "Ensure run-scoped state directory exists"
+      include_tasks: tasks/create_state_directory.yml
+
+    # ------------------------------------------------------------------
+    # AFTER VERSION COLLECTION (runs on remote hosts)
+    # ------------------------------------------------------------------
+    - name: "Collect Kernel versions AFTER"
+      include_tasks: tasks/validation_kernel_versions.yml
+      when: do_kernel | bool
+
+    - name: "Collect HANA versions AFTER"
+      include_tasks: tasks/validation_hana_versions.yml
+      when: do_hana | bool
+
+    # ------------------------------------------------------------------
+    # LOAD ALL STATE FILES (from controller)
+    # ------------------------------------------------------------------
+    - name: "Load maintenance state"
+      include_tasks: tasks/load_maintenance_state.yml
+
+    # ------------------------------------------------------------------
+    # MAINTENANCE TIMESTAMPS
+    # ------------------------------------------------------------------
+    - name: "Record Maintenance End Time"
+      copy:
+        content: "{{ ansible_date_time.date }} {{ ansible_date_time.time }}\n"
+        dest: "{{ _state_run_dir }}/end.txt"
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: "Load Maintenance Start Time"
+      slurp:
+        src: "{{ _state_run_dir }}/start.txt"
+      delegate_to: localhost
+      register: start_time_file
+      failed_when: false
+
+    - name: "Load Maintenance End Time"
+      slurp:
+        src: "{{ _state_run_dir }}/end.txt"
+      delegate_to: localhost
+      register: end_time_file
+      failed_when: false
+
+    - name: "Set Maintenance Time Variables"
+      set_fact:
+        maintenance_start_time: "{{ (start_time_file.content | b64decode).strip() if (start_time_file.content is defined) else 'N/A' }}"
+        maintenance_end_time: "{{ (end_time_file.content | b64decode).strip() if (end_time_file.content is defined) else 'N/A' }}"
+
+    # ------------------------------------------------------------------
+    # REPORT & EMAIL
+    # ------------------------------------------------------------------
+    - name: "Determine Overall Status"
+      set_fact:
+        _has_rollback: "{{ ansible_play_hosts | map('extract', hostvars, 'rollback_performed') | select('defined') | select('equalto', true) | list | length > 0 }}"
+        _has_critical: "{{ ansible_play_hosts | map('extract', hostvars, 'icinga_critical_services') | select('defined') | map('length') | select('greaterthan', 0) | list | length > 0 }}"
+        _has_hana_failure: "{{ ansible_play_hosts | map('extract', hostvars, 'hana_update_status') | select('defined') | select('equalto', 'FAILED') | list | length > 0 }}"
+        _has_backup_failure: "{{ ansible_play_hosts | map('extract', hostvars, 'hana_backup_status') | select('defined') | select('equalto', 'FAILED') | list | length > 0 }}"
+        _has_downtime_retained: "{{ ansible_play_hosts | map('extract', hostvars, '_downtime_retained') | select('defined') | select('equalto', true) | list | length > 0 }}"
+        _has_client_failure: "{{ ansible_play_hosts | map('extract', hostvars, 'hana_client_update_status') | select('defined') | select('equalto', 'FAILED') | list | length > 0 }}"
+      run_once: true
+
+    - name: "Set Report Status"
+      set_fact:
+        maintenance_status: >-
+          {%- if _has_rollback | bool or _has_hana_failure | bool or _has_client_failure | bool -%}FAILURE
+          {%- elif _has_backup_failure | bool or _has_critical | bool -%}PARTIAL
+          {%- else -%}SUCCESS{%- endif -%}
+      run_once: true
+
+    - name: "Create reports directory"
+      file:
+        path: "{{ playbook_dir }}/../reports"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: "Generate Maintenance Report"
+      template:
+        src: "{{ playbook_dir }}/../templates/maintenance_report.j2"
+        dest: "{{ playbook_dir }}/../reports/maintenance_{{ _state_prefix }}_{{ ansible_date_time.iso8601_basic_short }}.md"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: "Convert Maintenance Report to HTML"
+      shell: |
+        python3 "{{ playbook_dir }}/../scripts/md_to_html_email.py" \
+          "{{ playbook_dir }}/../reports/maintenance_{{ _state_prefix }}_{{ ansible_date_time.iso8601_basic_short }}.md" \
+          "{{ playbook_dir }}/../reports/maintenance_{{ _state_prefix }}_{{ ansible_date_time.iso8601_basic_short }}.html" \
+          --title "SAP Maintenance {{ maintenance_status }} - Pipeline {{ _state_prefix }}"
+      delegate_to: localhost
+      run_once: true
+      become: false
+      when: email_recipient | default('none') != 'none'
+
+    - name: "Send Maintenance Report Email"
+      include_role:
+        name: send_email
+      vars:
+        email_subject: "SAP Maintenance {{ maintenance_status }} - Pipeline {{ _state_prefix }} - {{ ansible_date_time.date }}{{ ' - DOWNTIME NOT REMOVED' if (_has_downtime_retained | default(false) | bool) else '' }}"
+        email_html_file: "{{ playbook_dir }}/../reports/maintenance_{{ _state_prefix }}_{{ ansible_date_time.iso8601_basic_short }}.html"
+      when: email_recipient | default('none') != 'none'
+      run_once: true
+
+    # ------------------------------------------------------------------
+    # FAIL WITH EXPLICIT HOST DETAILS (after report + email)
+    # ------------------------------------------------------------------
+    - name: "Fail pipeline on critical services or rollback"
+      fail:
+        msg: >-
+          Maintenance {{ maintenance_status }}:
+          {% if _has_rollback | bool %}
+          Kernel rollback on {{ ansible_play_hosts | map('extract', hostvars, 'rollback_performed') | zip(ansible_play_hosts) | selectattr(0, 'equalto', true) | map(attribute=1) | list | join(', ') }}.
+          {% set rollback_errors = ansible_play_hosts | map('extract', hostvars, 'rollback_error') | select('defined') | reject('equalto', '') | list %}
+          {% if rollback_errors | length > 0 %}Reason: {{ rollback_errors | first }}{% endif %}
+          {% endif %}
+          {% if _has_hana_failure | bool %}
+          HANA update failed on {% for h in ansible_play_hosts if hostvars[h].hana_update_status | default('') == 'FAILED' %}{{ h }}{% if not loop.last %}, {% endif %}{% endfor %}.
+          {% set hana_errors = ansible_play_hosts | map('extract', hostvars, 'hana_update_error') | select('defined') | reject('equalto', '') | list %}
+          {% if hana_errors | length > 0 %}Reason: {{ hana_errors | first }}{% endif %}
+          {% endif %}
+          {% if _has_client_failure | bool %}
+          HANA Client update failed on {% for h in ansible_play_hosts if hostvars[h].hana_client_update_status | default('') == 'FAILED' %}{{ h }}{% if not loop.last %}, {% endif %}{% endfor %}.
+          {% set client_errors = ansible_play_hosts | map('extract', hostvars, 'hana_client_update_error') | select('defined') | reject('equalto', '') | list %}
+          {% if client_errors | length > 0 %}Reason: {{ client_errors | first }}{% endif %}
+          {% endif %}
+          {% if _has_backup_failure | bool %}HANA backup failed. {% endif %}
+          {% if _has_downtime_retained | bool %}Icinga downtime NOT removed - manual check required. {% endif %}
+      when: maintenance_status != 'SUCCESS'
+      run_once: true

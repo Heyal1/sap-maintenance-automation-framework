@@ -1,0 +1,31 @@
+---
+###############################################################################
+# icinga_downtime Role - Default Variables
+###############################################################################
+# Purpose: Set and remove Icinga2 downtimes via REST API
+# Required Variables: icinga_url, icinga_user, icinga_password
+# Optional Variables: icinga_duration (default: 3600s)
+###############################################################################
+
+# Shared maintenance switches keep the operator-facing toggle registry explicit.
+do_kernel: false  # Default false; do not process kernel-specific maintenance unless selected.
+do_hana: false  # Default false; do not process HANA-specific maintenance unless selected.
+do_os_patch: false  # Default false; do not trigger OS patching behavior unless selected.
+skip_icinga: false  # Default false; true bypasses Icinga checks and downtime handling.
+do_root_keys: false  # Default false; true enables HANA root key handling where supported.
+
+# Icinga2 API endpoint. Override with ICINGA_URL or pipeline variables.
+icinga_url: "https://icinga.example.invalid:5665"
+
+# Icinga2 API credentials (from environment or secret store)
+icinga_user: ""
+icinga_password: ""
+
+# Downtime duration in seconds (default: 1 hour)
+icinga_duration: 3600
+
+# Action to perform: 'set' or 'remove'
+icinga_action: "set"
+
+# Downtime comment
+icinga_comment: "SAP Maintenance via Ansible Automation"

@@ -1,0 +1,100 @@
+---
+# =============================================================================
+# Icinga Downtime - SET Action
+# =============================================================================
+# Dedicated systems keep the historical host-level downtime with all_services.
+# Shared HANA systems schedule service downtimes per SID/target host.
+# =============================================================================
+
+- name: "Calculate downtime times"
+  ansible.builtin.set_fact:
+    downtime_start: "{{ ansible_date_time.epoch }}"
+    downtime_end: "{{ ansible_date_time.epoch | int + icinga_duration | int }}"
+
+- name: "Schedule shared HANA service downtimes"
+  ansible.builtin.uri:
+    url: "{{ icinga_url }}/v1/actions/schedule-downtime"
+    method: POST
+    user: "{{ icinga_user }}"
+    password: "{{ icinga_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    headers:
+      Accept: "application/json"
+    body_format: json
+    body:
+      type: "Service"
+      filter: "(host.name == filterHost || host.address == filterAddress) && (service.display_name == filterService || service.name == filterService)"
+      filter_vars:
+        filterHost: "{{ item.target_host }}"
+        filterAddress: "{{ item.target_address }}"
+        filterService: "{{ item.service_display_name }}"
+      author: "{{ current_downtime_author }}"
+      comment: "{{ icinga_comment }}"
+      start_time: "{{ downtime_start }}"
+      end_time: "{{ downtime_end }}"
+      fixed: true
+      duration: "{{ icinga_duration }}"
+    status_code: [200]
+  loop: "{{ icinga_service_downtime_targets | default([]) }}"
+  loop_control:
+    label: "{{ item.sid }} -> {{ item.target_host }} :: {{ item.service_display_name }}"
+  register: downtime_set_service_result
+  delegate_to: localhost
+  retries: 3
+  delay: 10
+  until: downtime_set_service_result.status == 200
+  when:
+    - _icinga_use_shared_sid_downtime | default(false) | bool
+    - (icinga_service_downtime_targets | default([]) | length) > 0
+
+- name: "Shared HANA downtime scheduled"
+  ansible.builtin.debug:
+    msg: >-
+      Host: {{ inventory_hostname }} |
+      SIDs: {{ icinga_service_downtime_targets | map(attribute='sid') | unique | list | join(', ') }} |
+      Services: {{ icinga_service_downtime_targets | length }}
+  when:
+    - _icinga_use_shared_sid_downtime | default(false) | bool
+    - (icinga_service_downtime_targets | default([]) | length) > 0
+
+- name: "No shared HANA downtime targets resolved"
+  ansible.builtin.debug:
+    msg: "Host: {{ inventory_hostname }} | No per-SID Icinga service downtimes were created"
+  when:
+    - _icinga_use_shared_sid_downtime | default(false) | bool
+    - (icinga_service_downtime_targets | default([]) | length) == 0
+
+- name: "Schedule HOST downtime (all services)"
+  ansible.builtin.uri:
+    url: "{{ icinga_url }}/v1/actions/schedule-downtime"
+    method: POST
+    user: "{{ icinga_user }}"
+    password: "{{ icinga_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    headers:
+      Accept: "application/json"
+    body_format: json
+    body:
+      type: "Host"
+      filter: "host.name==\"{{ inventory_hostname }}\" || host.address==\"{{ ansible_host | default(inventory_hostname) }}\""
+      author: "{{ current_downtime_author }}"
+      comment: "{{ icinga_comment }}"
+      start_time: "{{ downtime_start }}"
+      end_time: "{{ downtime_end }}"
+      fixed: true
+      duration: "{{ icinga_duration }}"
+      all_services: true
+    status_code: [200]
+  register: downtime_set_result
+  delegate_to: localhost
+  retries: 3
+  delay: 10
+  until: downtime_set_result.status == 200
+  when: not (_icinga_use_shared_sid_downtime | default(false) | bool)
+
+- name: "Downtime scheduled"
+  ansible.builtin.debug:
+    msg: "Host: {{ inventory_hostname }} | Duration: {{ icinga_duration | int // 60 }}min | Objects: {{ downtime_set_result.json.results | length }}"
+  when: not (_icinga_use_shared_sid_downtime | default(false) | bool)

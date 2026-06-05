@@ -1,0 +1,269 @@
+# ============================================================================
+# SAP Maintenance: Start SAP + HANA Systems
+# ============================================================================
+# Consolidated lifecycle start stage for maintenance runs.
+#
+# Sequence: read pre-maintenance state -> start database instances first
+# -> verify -> start application instances second -> verify.
+#
+# Pipeline Stage: StartApplications
+# ============================================================================
+
+- name: "SAP Maintenance: Start SAP + HANA Systems"
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    do_kernel: false
+    do_hana: false
+    do_os_patch: false
+    inject_failure_start: false
+
+  vars_files:
+    - ../vars/common.yml
+
+  tasks:
+    - name: "Skip start workflow for precheck-only runs"
+      meta: end_play
+      when: not ((do_kernel | bool) or (do_hana | bool) or (do_os_patch | bool))
+
+    - name: "Run start workflow"
+      block:
+        - name: "Log active switch values"
+          include_tasks: tasks/log_switch_state.yml
+
+        - name: "Run shared SAP discovery"
+          include_tasks: tasks/discover_sap_facts.yml
+
+        - name: "Determine lifecycle scope for selected update types"
+          set_fact:
+            _is_shared_hana_host: "{{ (hana_shared | default(false) | bool) and (is_hana | default(false) | bool) and not (is_netweaver | default(false) | bool) }}"
+            _manage_application_lifecycle: "{{ (do_kernel | bool) or (do_hana | bool) or (do_os_patch | bool) }}"
+            _manage_database_lifecycle: "{{ (do_hana | bool) or (do_os_patch | bool) }}"
+            _manage_host_lifecycle: >-
+              {{
+                ((_is_shared_hana_host | default(false) | bool) and ((do_kernel | bool) or (do_hana | bool) or (do_os_patch | bool)))
+                or
+                ((is_netweaver | default(false)) and ((do_kernel | bool) or (do_hana | bool) or (do_os_patch | bool)))
+                or
+                ((is_hana | default(false)) and not (is_netweaver | default(false)) and ((do_hana | bool) or (do_os_patch | bool)))
+              }}
+
+        - name: "Skip hosts outside the selected lifecycle scope"
+          meta: end_host
+          when: not (_manage_host_lifecycle | bool)
+
+        - name: "Inject start failure"
+          fail:
+            msg: "Injected start failure for rescue path validation."
+          when: inject_failure_start | bool
+
+        - name: "Ensure run-scoped state directory exists for shared host"
+          include_tasks: tasks/create_state_directory.yml
+          when: _is_shared_hana_host | default(false) | bool
+
+        - name: "Initialize shared HANA start report state"
+          set_fact:
+            _shared_hana_host_state_dir: "{{ _state_dir }}"
+            shared_hana_start_results: []
+          when: _is_shared_hana_host | default(false) | bool
+
+        - name: "Build shared HANA lifecycle contexts"
+          include_tasks: tasks/build_shared_hana_instance_contexts.yml
+          when: _is_shared_hana_host | default(false) | bool
+
+        - name: "Run shared HANA start workflow"
+          include_tasks: tasks/shared_hana_start_instance.yml
+          loop: "{{ shared_hana_instance_contexts | default([]) | sort(attribute='instance_tier_rank', reverse=true) }}"
+          loop_control:
+            loop_var: shared_hana_instance_ctx
+            label: "{{ shared_hana_instance_ctx.instance_name }}"
+          when: _is_shared_hana_host | default(false) | bool
+
+        - name: "Persist shared HANA start state"
+          copy:
+            content: |-
+              {{ {
+                'shared_hana_start_results': shared_hana_start_results | default([])
+              } | to_json }}
+            dest: "{{ _shared_hana_host_state_dir }}/shared_hana_start_state_{{ inventory_hostname }}.json"
+            mode: '0644'
+          delegate_to: localhost
+          become: false
+          when: _is_shared_hana_host | default(false) | bool
+
+        - name: "Ensure run-scoped state directory exists"
+          include_tasks: tasks/create_state_directory.yml
+          when: not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Read pre-maintenance instance state"
+          slurp:
+            src: "{{ _state_dir }}/instance_state.yml"
+          delegate_to: localhost
+          become: false
+          register: _instance_state_raw
+          failed_when: false
+          when: not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Fail when pre-maintenance instance state is missing"
+          fail:
+            msg: "Missing pre-maintenance state file at {{ _state_dir }}/instance_state.yml for {{ inventory_hostname }}."
+          when:
+            - (is_netweaver | default(false)) or (is_hana | default(false))
+            - _instance_state_raw.content is not defined
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Parse pre-maintenance instance state"
+          set_fact:
+            _instance_state_data: "{{ _instance_state_raw.content | b64decode | from_yaml }}"
+            _pre_maintenance_was_running: "{{ (_instance_state_raw.content | b64decode | from_yaml).was_running | default(false) | bool }}"
+          when:
+            - _instance_state_raw.content is defined
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Leave previously stopped components unchanged"
+          debug:
+            msg: "SID {{ sap_sid }} on {{ inventory_hostname }} was {{ _instance_state_data.pre_maintenance_state | default('stopped') }} before maintenance. Leaving it stopped."
+          when:
+            - _instance_state_raw.content is defined
+            - not (_pre_maintenance_was_running | default(false) | bool)
+            - (is_netweaver | default(false)) or (is_hana | default(false))
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Start HANA database instances"
+          sap.sap_operations.system:
+            instance_number: "{{ sap_info.instances[0].mSystemNumber }}"
+            state: started
+            wait: true
+            wait_timeout: "{{ sap_start_timeout_seconds }}"
+          when:
+            - is_hana | default(false)
+            - not (is_netweaver | default(false))
+            - _manage_database_lifecycle | default(false) | bool
+            - _pre_maintenance_was_running | default(false) | bool
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Refresh SAP discovery after HANA start"
+          sap.sap_operations.host_info:
+          register: _hana_start_verification
+          failed_when: >-
+            (_hana_start_verification.msg is defined and 'SOAP' in (_hana_start_verification.msg | upper))
+            or (_hana_start_verification.instances | default([]) | length == 0)
+          when:
+            - is_hana | default(false)
+            - not (is_netweaver | default(false))
+            - _manage_database_lifecycle | default(false) | bool
+            - _pre_maintenance_was_running | default(false) | bool
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Verify HANA database instances reached running state"
+          assert:
+            that:
+              - (_hana_started_processes | length) > 0
+              - (_hana_green_processes | length) == (_hana_started_processes | length)
+            fail_msg: "HANA components for {{ inventory_hostname }} did not reach the expected running state."
+          vars:
+            _hana_started_processes: "{{ _hana_start_verification.instances | default([]) | map(attribute='ProcessList') | select('defined') | flatten | list }}"
+            _hana_green_processes: >-
+              {{
+                (
+                  _hana_start_verification.instances | default([])
+                  | map(attribute='ProcessList')
+                  | select('defined')
+                  | flatten
+                  | selectattr('dispstatus', 'equalto', 'SAPControl-GREEN')
+                  | list
+                )
+                +
+                (
+                  _hana_start_verification.instances | default([])
+                  | map(attribute='ProcessList')
+                  | select('defined')
+                  | flatten
+                  | selectattr('dispstatus', 'equalto', 'GREEN')
+                  | list
+                )
+              }}
+          when:
+            - is_hana | default(false)
+            - not (is_netweaver | default(false))
+            - _manage_database_lifecycle | default(false) | bool
+            - _pre_maintenance_was_running | default(false) | bool
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Start NetWeaver application instances"
+          sap.sap_operations.system:
+            instance_number: "{{ anchor_instance_nr }}"
+            name: "ALL"
+            state: started
+            wait: true
+            wait_timeout: "{{ sap_start_timeout_seconds }}"
+          when:
+            - is_netweaver | default(false)
+            - _manage_application_lifecycle | default(false) | bool
+            - _pre_maintenance_was_running | default(false) | bool
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Refresh SAP discovery after NetWeaver start"
+          sap.sap_operations.host_info:
+          register: _netweaver_start_verification
+          failed_when: >-
+            (_netweaver_start_verification.msg is defined and 'SOAP' in (_netweaver_start_verification.msg | upper))
+            or (_netweaver_start_verification.instances | default([]) | length == 0)
+          when:
+            - is_netweaver | default(false)
+            - _manage_application_lifecycle | default(false) | bool
+            - _pre_maintenance_was_running | default(false) | bool
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Verify NetWeaver application instances reached running state"
+          assert:
+            that:
+              - (_netweaver_started_processes | length) > 0
+              - (_netweaver_green_processes | length) == (_netweaver_started_processes | length)
+            fail_msg: "NetWeaver components for {{ inventory_hostname }} did not reach the expected running state."
+          vars:
+            _netweaver_started_processes: "{{ _netweaver_start_verification.instances | default([]) | map(attribute='ProcessList') | select('defined') | flatten | list }}"
+            _netweaver_green_processes: >-
+              {{
+                (
+                  _netweaver_start_verification.instances | default([])
+                  | map(attribute='ProcessList')
+                  | select('defined')
+                  | flatten
+                  | selectattr('dispstatus', 'equalto', 'SAPControl-GREEN')
+                  | list
+                )
+                +
+                (
+                  _netweaver_start_verification.instances | default([])
+                  | map(attribute='ProcessList')
+                  | select('defined')
+                  | flatten
+                  | selectattr('dispstatus', 'equalto', 'GREEN')
+                  | list
+                )
+              }}
+          when:
+            - is_netweaver | default(false)
+            - _manage_application_lifecycle | default(false) | bool
+            - _pre_maintenance_was_running | default(false) | bool
+            - not (_is_shared_hana_host | default(false) | bool)
+      rescue:
+        - name: "Capture start failure context"
+          set_fact:
+            _start_stage_failed: true
+            _start_error_task: "{{ ansible_failed_task.name | default('Unknown task') }}"
+            _start_error_message: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown error'))) }}"
+            _start_error_details: "{{ ansible_failed_result | default({}) | to_nice_yaml }}"
+        - name: "Send start failure notification"
+          include_tasks: tasks/send_error_notification.yml
+          vars:
+            _error_stage: "Start Applications"
+            _error_task: "{{ _start_error_task }}"
+            _error_host: "{{ inventory_hostname }}"
+            _error_message: >-
+              Task "{{ _start_error_task }}" failed: {{ _start_error_message }}
+              Restart outcome: start stage failed.
+            _error_details: "{{ _start_error_details }}"

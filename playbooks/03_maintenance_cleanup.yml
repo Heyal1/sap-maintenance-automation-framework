@@ -1,0 +1,45 @@
+# ============================================================================
+# SAP Maintenance: Cleanup (Manual Recovery)
+# ============================================================================
+# Manual operator playbook for removing retained Icinga downtimes after a
+# failed or aborted maintenance run has been investigated.
+# Not called automatically by the pipeline. FR-046 keeps downtime active on
+# failures; automatic removal is limited to the successful validation path.
+# ============================================================================
+- name: "SAP Maintenance: Cleanup"
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars_files:
+    - ../vars/common.yml
+
+  tasks:
+    - name: "Run shared SAP discovery"
+      include_tasks: tasks/discover_sap_facts.yml
+
+    - name: "Run Icinga discovery"
+      include_tasks: tasks/discover_icinga_facts.yml
+      when: not (skip_icinga | default(false) | bool)
+
+    - name: "Remove Icinga Downtime (manual cleanup)"
+      include_role:
+        name: icinga_downtime
+      vars:
+        icinga_url: "{{ icinga_api_url }}"
+        icinga_user: "{{ icinga_api_user }}"
+        icinga_password: "{{ icinga_api_pass }}"
+        icinga_action: "remove"
+      ignore_errors: true
+      when:
+        - not (skip_icinga | default(false) | bool)
+        - (icinga_downtime_targets | default([]) | length) > 0
+
+    - name: "Cleanup complete"
+      debug:
+        msg: >-
+          {% if skip_icinga | default(false) | bool %}
+          Icinga cleanup skipped (skip_icinga=true)
+          {% else %}
+          Icinga downtimes removed for {{ inventory_hostname }} by manual cleanup
+          {% endif %}

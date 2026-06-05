@@ -1,0 +1,44 @@
+# SAP STAGING REPORT
+
+| Field | Value |
+|-------|-------|
+| Pipeline Run | {{ pipeline_run_id | default(staging_run_id) }} |
+| Report Generated | {{ ansible_date_time.date }} {{ ansible_date_time.time }} |
+| Customer | {{ staging_customer | default('UNKNOWN') }} |
+| Environment | {{ staging_environment | default('UNKNOWN') }} |
+| Method | {{ staging_method | default('unknown') }} |
+| Source Directory | {{ source_dir | default('N/A') }} |
+| Prepared Directory | {{ prepared_dir | default('N/A') }} |
+| Component Filter Active | {{ 'true' if component_filter_active | default(false) | bool else 'false' }} |
+| Email Recipient | {{ email_recipient | default('none') }} |
+
+## Component Selection
+
+| Component | Selected | Source Archives | Prepared Files |
+|-----------|----------|-----------------|----------------|
+| SAP Kernel | {{ 'true' if stage_kernel_selected | default(false) | bool else 'false' }} | {{ kernel_sars | default([]) | length }} | {{ kernel_files_count.matched | default(0) }} |
+| HANA Server Medium | {{ 'true' if stage_hana_selected | default(false) | bool else 'false' }} | {{ hana_server_sars | default([]) | length }} | {{ hana_files_count.matched | default(0) }} |
+| HANA Client Medium | {{ 'true' if stage_hana_selected | default(false) | bool else 'false' }} | {{ hana_client_sars | default([]) | length }} | {{ hana_client_files_count.matched | default(0) }} |
+| Hostagent | {{ 'true' if stage_hostagent_selected | default(false) | bool else 'false' }} | {{ hostagent_sars | default([]) | length }} | {{ hostagent_files_count.matched | default(0) }} |
+
+## Selected Source Files
+
+| Bucket | Files |
+|--------|-------|
+| SAPCAR | {{ sapcar_files | default([]) | map(attribute='path') | map('basename') | list | join(', ') if (sapcar_files | default([]) | length > 0) else '-' }} |
+| Kernel | {{ kernel_sars | default([]) | map(attribute='path') | map('basename') | list | join(', ') if (kernel_sars | default([]) | length > 0) else '-' }} |
+| HANA Server | {{ hana_server_sars | default([]) | map(attribute='path') | map('basename') | list | join(', ') if (hana_server_sars | default([]) | length > 0) else '-' }} |
+| HANA Client | {{ hana_client_sars | default([]) | map(attribute='path') | map('basename') | list | join(', ') if (hana_client_sars | default([]) | length > 0) else '-' }} |
+| Hostagent | {{ hostagent_sars | default([]) | map(attribute='path') | map('basename') | list | join(', ') if (hostagent_sars | default([]) | length > 0) else '-' }} |
+
+## Per-Host Distribution
+
+| Host | SID | Roles | Kernel | HANA Server | HANA Client | Hostagent |
+|------|-----|-------|--------|-------------|-------------|-----------|
+{% for host in ansible_play_hosts | sort %}
+{% set h = hostvars[host] %}
+{% set ns = namespace(roles=[]) %}
+{% if h.is_app_server | default(false) | bool %}{% if ns.roles.append('App Server') %}{% endif %}{% endif %}
+{% if h.is_hana_server | default(false) | bool %}{% if ns.roles.append('HANA Server') %}{% endif %}{% endif %}
+| {{ host }} | {{ h.sap_sid | default('N/A') }} | {{ ns.roles | join(', ') if ns.roles | length > 0 else 'No SAP role detected' }} | {% if not (h.is_app_server | default(false) | bool) %}N/A{% elif not (stage_kernel_selected | default(false) | bool) %}SKIPPED{% elif (h.kernel_upload_files.matched | default(0) | int) > 0 %}STAGED{% else %}NO FILES{% endif %} | {% if not (h.is_hana_server | default(false) | bool) %}N/A{% elif not (stage_hana_selected | default(false) | bool) %}SKIPPED{% elif (h.hana_upload_files.matched | default(0) | int) > 0 %}STAGED{% else %}NO FILES{% endif %} | {% if not (h.is_app_server | default(false) | bool) %}N/A{% elif not (stage_hana_selected | default(false) | bool) %}SKIPPED{% elif (h.hana_client_upload_files.matched | default(0) | int) > 0 %}STAGED{% else %}NO FILES{% endif %} | {% if not (h.is_hana_server | default(false) | bool) %}N/A{% elif not (stage_hostagent_selected | default(false) | bool) %}SKIPPED{% elif (h.hostagent_upload_files.matched | default(0) | int) > 0 %}STAGED{% else %}NO FILES{% endif %} |
+{% endfor %}

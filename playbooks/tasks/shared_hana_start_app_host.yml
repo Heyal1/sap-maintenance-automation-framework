@@ -1,0 +1,74 @@
+---
+# =============================================================================
+# Shared Task: shared_hana_start_app_host.yml
+# =============================================================================
+# Restarts one application host attached to a shared HANA tenant when it was
+# running before maintenance.
+# =============================================================================
+
+- name: "Leave shared application host {{ shared_hana_app_host_state.host }} unchanged for SID {{ shared_hana_tenant_state.sid }}"
+  debug:
+    msg: "Application host {{ shared_hana_app_host_state.host }} for SID {{ shared_hana_tenant_state.sid }} was stopped before maintenance. Leaving it stopped."
+  when: not (shared_hana_app_host_state.was_running | default(false) | bool)
+
+- name: "Fail when shared app host state lacks an instance number for {{ shared_hana_app_host_state.host }}"
+  fail:
+    msg: "Shared app host {{ shared_hana_app_host_state.host }} for SID {{ shared_hana_tenant_state.sid }} is missing an instance number in the recorded state."
+  when:
+    - shared_hana_app_host_state.was_running | default(false) | bool
+    - (shared_hana_app_host_state.instance_number | default('') | string | trim | length) == 0
+
+- name: "Start shared application host {{ shared_hana_app_host_state.host }} for SID {{ shared_hana_tenant_state.sid }}"
+  sap.sap_operations.system:
+    instance_number: "{{ shared_hana_app_host_state.instance_number }}"
+    name: "ALL"
+    state: started
+    wait: true
+    wait_timeout: "{{ sap_start_timeout_seconds }}"
+  delegate_to: "{{ shared_hana_app_host_state.host }}"
+  when:
+    - _manage_application_lifecycle | default(false) | bool
+    - shared_hana_app_host_state.was_running | default(false) | bool
+
+- name: "Refresh shared application host discovery for {{ shared_hana_app_host_state.host }}"
+  sap.sap_operations.host_info:
+  delegate_to: "{{ shared_hana_app_host_state.host }}"
+  register: _shared_hana_app_host_start_verification
+  failed_when: >-
+    (_shared_hana_app_host_start_verification.msg is defined and 'SOAP' in (_shared_hana_app_host_start_verification.msg | upper))
+    or (_shared_hana_app_host_start_verification.instances | default([]) | length == 0)
+  when:
+    - _manage_application_lifecycle | default(false) | bool
+    - shared_hana_app_host_state.was_running | default(false) | bool
+
+- name: "Verify shared application host {{ shared_hana_app_host_state.host }} reached running state"
+  assert:
+    that:
+      - (_shared_started_app_processes | length) > 0
+      - (_shared_green_app_processes | length) == (_shared_started_app_processes | length)
+    fail_msg: "Application host {{ shared_hana_app_host_state.host }} for SID {{ shared_hana_tenant_state.sid }} did not reach the expected running state."
+  vars:
+    _shared_started_app_processes: "{{ _shared_hana_app_host_start_verification.instances | default([]) | map(attribute='ProcessList') | select('defined') | flatten | list }}"
+    _shared_green_app_processes: >-
+      {{
+        (
+          _shared_hana_app_host_start_verification.instances | default([])
+          | map(attribute='ProcessList')
+          | select('defined')
+          | flatten
+          | selectattr('dispstatus', 'equalto', 'SAPControl-GREEN')
+          | list
+        )
+        +
+        (
+          _shared_hana_app_host_start_verification.instances | default([])
+          | map(attribute='ProcessList')
+          | select('defined')
+          | flatten
+          | selectattr('dispstatus', 'equalto', 'GREEN')
+          | list
+        )
+      }}
+  when:
+    - _manage_application_lifecycle | default(false) | bool
+    - shared_hana_app_host_state.was_running | default(false) | bool

@@ -1,0 +1,80 @@
+---
+# =============================================================================
+# Role: send_email - Send HTML email via local sendmail
+# =============================================================================
+# Constructs a MIME email message and sends it via the controller's local
+# sendmail binary. Supports optional file attachments.
+#
+# MIME structure (with attachments):
+#   multipart/mixed
+#   ├─ text/html (main body from email_html_file)
+#   ├─ text/html attachment 1
+#   └─ text/html attachment 2
+#
+# Without attachments, a simple text/html message is sent (no multipart).
+#
+# Required vars:
+#   email_recipient:      Target email address (set to 'none' to skip)
+#   email_subject:        Email subject line
+#   email_html_file:      Path to HTML file (body)
+# Optional vars:
+#   email_sender:         From address (default: sap.automation@example.invalid)
+#   email_attachment_files: List of {path, filename} dicts for attachments
+#
+# Special case: email_recipient='none' skips sending (used when pipeline
+# parameter mail_recipient is left empty).
+# =============================================================================
+
+- name: "Verify email prerequisites"
+  assert:
+    that:
+      - email_recipient is defined and email_recipient != 'none' and email_recipient | length > 0
+      - email_html_file is defined and email_html_file | length > 0
+    fail_msg: "email_recipient and email_html_file must be defined"
+  delegate_to: localhost
+
+- name: "Verify HTML file exists"
+  stat:
+    path: "{{ email_html_file }}"
+  register: _email_html_stat
+  delegate_to: localhost
+
+- name: "Fail if HTML file missing"
+  fail:
+    msg: "HTML file not found: {{ email_html_file }}"
+  when: not _email_html_stat.stat.exists
+
+- name: "Send email with attachments"
+  shell: |
+    BOUNDARY="boundary_$(date +%s)"
+    {
+      echo "MIME-Version: 1.0"
+      echo "From: {{ email_sender }}"
+      echo "To: {{ email_recipient }}"
+      echo "Subject: {{ email_subject }}"
+    {% if email_attachment_files | default([]) | length > 0 %}
+      echo "Content-Type: multipart/mixed; boundary=\"$BOUNDARY\""
+      echo ""
+      echo "--$BOUNDARY"
+      echo "Content-Type: text/html; charset=utf-8"
+      echo ""
+      cat "{{ email_html_file }}"
+    {% for attachment in email_attachment_files %}
+      echo ""
+      echo "--$BOUNDARY"
+      echo "Content-Type: text/html; charset=utf-8"
+      echo "Content-Disposition: attachment; filename=\"{{ attachment.filename }}\""
+      echo ""
+      cat "{{ attachment.path }}"
+    {% endfor %}
+      echo ""
+      echo "--$BOUNDARY--"
+    {% else %}
+      echo "Content-Type: text/html; charset=utf-8"
+      echo ""
+      cat "{{ email_html_file }}"
+    {% endif %}
+    } | sendmail -t
+  changed_when: false
+  delegate_to: localhost
+  when: email_recipient | default('none') != 'none'

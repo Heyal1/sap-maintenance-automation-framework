@@ -1,0 +1,204 @@
+---
+# =============================================================================
+# Shared Task: validation_kernel_versions.yml
+# =============================================================================
+# Compares the BEFORE-state (captured by precheck_kernel_versions.yml) with
+# the AFTER-state of the SAP kernel following a kernel update.
+#
+# Three comparisons are performed:
+#   1. SAP patch number: BEFORE vs. AFTER (did the main version change?)
+#   2. Key executable versions: per-binary BEFORE/AFTER comparison
+#      → builds a JSON array of {name, before, after, changed} objects
+#   3. Kernel file inventory: MD5-based diff detecting CHANGED/NEW/REMOVED
+#      files → builds a JSON change log for the maintenance report
+#
+# All results are persisted as JSON state files on the Ansible controller
+# so that the maintenance_report.j2 template can render them.
+#
+# Only runs on NetWeaver hosts (is_netweaver=true).
+# Included by: 03_maintenance_validation.yml (when do_kernel=true)
+# =============================================================================
+
+# --- 1. SAP Patch Number Comparison -----------------------------------------
+# Load the BEFORE version from the state file (base64-encoded by slurp),
+# then capture the current AFTER version with the same disp+work command.
+- name: "Load BEFORE Version"
+  slurp:
+    src: "{{ _state_dir }}/ver_before_{{ inventory_hostname }}.txt"
+  delegate_to: localhost
+  register: ver_before_file
+  failed_when: false
+  when: is_netweaver | default(false)
+
+- name: "Get SAP Version AFTER Update"
+  shell: |
+    set -o pipefail
+    export LD_LIBRARY_PATH=/usr/sap/{{ sap_sid }}/SYS/exe/run
+    cd /usr/sap/{{ sap_sid }}/SYS/exe/run
+    # Primary: run disp+work -v
+    version=$(timeout 10 ./disp+work -v 2>&1 | awk '/patch number/ {print $3; exit}')
+    # Fallback: extract from binary strings
+    if [ -z "$version" ]; then
+      version=$(strings ./disp+work 2>/dev/null | awk '/patch number/ {print $3; exit}')
+    fi
+    printf '%s\n' "$version"
+  args:
+    executable: /bin/bash
+  register: ver_after
+  changed_when: false
+  failed_when: false
+  when: is_netweaver | default(false)
+
+# Decode the base64 content from slurp and set both versions as host facts
+- name: "Set Version Variables"
+  set_fact:
+    version_before: "{{ (ver_before_file.content | b64decode).strip() if (ver_before_file.content is defined) else 'N/A' }}"
+    version_after: "{{ ver_after.stdout | default('N/A') }}"
+  when: is_netweaver | default(false)
+
+# --- 2. Key Executable Version Comparison ------------------------------------
+# Same 5 binaries as precheck: disp+work, tp, R3trans, sapstartsrv, sapwebdisp
+- name: "Get Key Executable Versions AFTER"
+  shell: |
+    set -o pipefail
+    cd /usr/sap/{{ sap_sid }}/SYS/exe/run
+    export LD_LIBRARY_PATH=$(pwd)
+    version_info=$(/usr/sap/hostctrl/exe/sapcontrol -nr {{ anchor_instance_nr | default('00') }} -function GetVersionInfo 2>/dev/null || true)
+    for exe in disp+work tp R3trans sapstartsrv sapwebdisp; do
+      ver=""
+      if [ -n "$version_info" ]; then
+        ver=$(printf '%s\n' "$version_info" | awk -F', ' -v exe="$exe" '$1 ~ ("/" exe "$") { if (NF >= 2) { print substr($0, index($0, $2)); exit } }')
+      fi
+      if [ -f "$exe" ]; then
+        # Primary fallback: run executable with -v when sapcontrol does not provide the entry.
+        # Skip sapstartsrv here because it behaves like a daemon and may hang instead of printing a version.
+        # Fallback: extract version from binary strings (works even when -v hangs or outputs nothing)
+        if [ -z "$ver" ] && [ "$exe" != "sapstartsrv" ]; then
+          ver=$(timeout 10 ./"$exe" -v 2>&1 | awk 'tolower($0) ~ /patch number|release|version/ {sub(/^[[:space:]]+/, "", $0); print; exit}')
+        fi
+        if [ -z "$ver" ]; then
+          ver=$(strings ./$exe 2>/dev/null | awk 'tolower($0) ~ /patch number/ {sub(/^[[:space:]]+/, "", $0); print; exit}')
+        fi
+        if [ -z "$ver" ]; then
+          ver=$(strings ./$exe 2>/dev/null | awk 'tolower($0) ~ /kernel release/ {sub(/^[[:space:]]+/, "", $0); print; exit}')
+        fi
+      else
+        ver=""
+      fi
+      printf '%s|%s\n' "$exe" "$ver"
+    done
+  args:
+    executable: /bin/bash
+  register: key_exe_versions_after
+  changed_when: false
+  failed_when: false
+  when: is_netweaver | default(false)
+
+- name: "Load Key Executable Versions BEFORE"
+  slurp:
+    src: "{{ _state_dir }}/key_exe_before_{{ inventory_hostname }}.txt"
+  delegate_to: localhost
+  register: key_exe_before_file
+  failed_when: false
+  when: is_netweaver | default(false)
+
+# Build a JSON array comparing BEFORE/AFTER for each key executable.
+# Steps: 1) Parse pipe-delimited "exe|version" lines into dicts,
+#         2) For each of the 5 known binaries, build {name, before, after, changed}.
+# The output is used by maintenance_report.j2 to render the version table.
+- name: "Build Key Executable Version Comparison"
+  set_fact:
+    key_exe_comparison: >-
+      {%- set result = [] -%}
+      {%- set before_lines = (key_exe_before_file.content | b64decode).strip().split('\n') if (key_exe_before_file.content is defined) else [] -%}
+      {%- set after_lines = (key_exe_versions_after.stdout | default('')).strip().split('\n') -%}
+      {%- set before_dict = {} -%}
+      {%- set after_dict = {} -%}
+      {%- for line in before_lines if '|' in line -%}
+        {%- set _ = before_dict.update({line.split('|')[0]: line.split('|')[1]}) -%}
+      {%- endfor -%}
+      {%- for line in after_lines if '|' in line -%}
+        {%- set _ = after_dict.update({line.split('|')[0]: line.split('|')[1]}) -%}
+      {%- endfor -%}
+      {%- for exe in ['disp+work', 'tp', 'R3trans', 'sapstartsrv', 'sapwebdisp'] -%}
+        {%- if exe in after_dict or exe in before_dict -%}
+          {%- set b = before_dict.get(exe, 'N/A') -%}
+          {%- set a = after_dict.get(exe, 'N/A') -%}
+          {%- set _ = result.append({'name': exe, 'before': b, 'after': a, 'changed': b != a}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ result | to_json }}
+  when: is_netweaver | default(false)
+
+# --- 3. Kernel File Inventory Comparison (MD5-based change detection) --------
+# Compares the BEFORE and AFTER MD5 checksums for every file in the kernel
+# directory. Output format per file: {file, status} where status is one of:
+#   CHANGED  — file exists in both snapshots but MD5 differs
+#   UNCHANGED — file exists in both and MD5 matches
+#   NEW      — file only exists in AFTER (added during update)
+#   REMOVED  — file only exists in BEFORE (deleted during update)
+# md5sum output format: "<hash>  <filename>" — split on double-space.
+- name: "Create Kernel File Inventory AFTER"
+  shell: |
+    cd /usr/sap/{{ sap_sid }}/SYS/exe/run
+    find . -maxdepth 1 -type f -exec md5sum {} \; 2>/dev/null | sort -k2
+  register: kernel_file_inventory_after
+  changed_when: false
+  failed_when: false
+  when: is_netweaver | default(false)
+
+- name: "Load Kernel File Inventory BEFORE"
+  slurp:
+    src: "{{ _state_dir }}/kernel_inventory_before_{{ inventory_hostname }}.txt"
+  delegate_to: localhost
+  register: kernel_inv_before_file
+  failed_when: false
+  when: is_netweaver | default(false)
+
+# Build a JSON change log by comparing MD5 dictionaries (filename→hash).
+# Union of all filenames from both snapshots is iterated to classify each
+# file as CHANGED, UNCHANGED, NEW, or REMOVED.
+- name: "Build Kernel File Change Log"
+  set_fact:
+    kernel_change_log: >-
+      {%- set before_raw = (kernel_inv_before_file.content | b64decode).strip() if (kernel_inv_before_file.content is defined) else '' -%}
+      {%- set after_raw = (kernel_file_inventory_after.stdout | default('')).strip() -%}
+      {%- set before_dict = {} -%}
+      {%- set after_dict = {} -%}
+      {%- for line in before_raw.split('\n') if line.strip() -%}
+        {%- set parts = line.strip().split('  ') -%}
+        {%- if parts | length >= 2 -%}
+          {%- set _ = before_dict.update({parts[1]: parts[0]}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- for line in after_raw.split('\n') if line.strip() -%}
+        {%- set parts = line.strip().split('  ') -%}
+        {%- if parts | length >= 2 -%}
+          {%- set _ = after_dict.update({parts[1]: parts[0]}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- set result = [] -%}
+      {%- set all_files = (before_dict.keys() | list + after_dict.keys() | list) | unique | sort -%}
+      {%- for f in all_files -%}
+        {%- if f in before_dict and f in after_dict -%}
+          {%- if before_dict[f] != after_dict[f] -%}
+            {%- set _ = result.append({'file': f, 'status': 'CHANGED'}) -%}
+          {%- else -%}
+            {%- set _ = result.append({'file': f, 'status': 'UNCHANGED'}) -%}
+          {%- endif -%}
+        {%- elif f in after_dict -%}
+          {%- set _ = result.append({'file': f, 'status': 'NEW'}) -%}
+        {%- else -%}
+          {%- set _ = result.append({'file': f, 'status': 'REMOVED'}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ result | to_json }}
+  when: is_netweaver | default(false)
+
+- name: "Save Kernel Change Log"
+  copy:
+    content: "{{ kernel_change_log | default('[]') }}"
+    dest: "{{ _state_dir }}/kernel_changelog_{{ inventory_hostname }}.json"
+  delegate_to: localhost
+  when: is_netweaver | default(false)
+

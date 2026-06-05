@@ -1,0 +1,122 @@
+---
+# =============================================================================
+# Role: downloadbasket_custom – SAP Download Basket File Retrieval
+# =============================================================================
+# Custom download role that replaces the upstream sap.sap_operations download
+# mechanism with a standalone Python script (download_sap_files.py).
+#
+# Why custom? The upstream collection's download module had persistent
+# authentication issues with SAP's redirect-based download URLs. This role
+# uses a requests.Session-based approach that handles auth redirects reliably.
+#
+# Workflow:
+#   1. Query SAP Download Basket API (me_downloadbasket_info) for item list
+#   2. Resolve each item's ObjectKey → get DirectDownloadUrl via me_file_info
+#   3. Prepare a JSON file list [{url, filename}, ...] for batch download
+#   4. Invoke download_sap_files.py with credentials + file list
+#   5. Fix ownership (aktansible:aktansible) for all downloaded files
+#   6. Make SAPCAR executables (*.EXE) executable (chmod 755)
+#      → Only SAPCAR needs execute permission; all other files are archives
+#
+# Required variables: downloadbasket_username, downloadbasket_password,
+#                     downloadbasket_destination, downloadbasket_timeout
+# =============================================================================
+
+# --- 1. Fetch basket contents from SAP Marketplace API ----------------------
+# ObjectKey = unique SAP file ID, ObjectDescription = human-readable name
+- name: Get download basket contents
+  sap.sap_operations.me_downloadbasket_info:
+    username: "{{ downloadbasket_username }}"
+    password: "{{ downloadbasket_password }}"
+  register: downloadbasket_contents
+  until: downloadbasket_contents is succeeded
+  retries: 3
+  delay: 5
+
+- name: Debug basket contents count
+  ansible.builtin.debug:
+    msg: "Found {{ downloadbasket_contents.me_downloadbasket_info | length }} items in basket"
+
+# --- 2. Resolve download URLs for each basket item --------------------------
+# Each ObjectKey maps to a DirectDownloadUrl and FileName via the file_info API.
+# Retry 3x with 5s delay to handle transient SAP API errors.
+- name: Get file information for each basket item
+  sap.sap_operations.me_file_info:
+    username: "{{ downloadbasket_username }}"
+    password: "{{ downloadbasket_password }}"
+    file_id: "{{ item.ObjectKey }}"
+  loop: "{{ downloadbasket_contents.me_downloadbasket_info }}"
+  loop_control:
+    label: "{{ item.ObjectDescription }} - {{ item.ObjectName }}"
+  register: downloadbasket_files_info
+  until: downloadbasket_files_info is succeeded
+  retries: 3
+  delay: 5
+
+- name: Debug files_info result count
+  ansible.builtin.debug:
+    msg: "Got file info for {{ downloadbasket_files_info.results | length }} items"
+
+- name: Ensure destination directory exists
+  ansible.builtin.file:
+    path: "{{ downloadbasket_destination }}"
+    state: directory
+    mode: '0755'
+    owner: aktansible
+    group: aktansible
+
+# --- 3. Build JSON input for the Python download script ---------------------
+# The script expects a JSON array of {url, filename} objects.
+# Inline Jinja2 template builds this from the resolved file info results.
+- name: Prepare file list for download script
+  set_fact:
+    download_files_json: |
+      [
+      {% for result in downloadbasket_files_info.results %}
+        {"url": "{{ result.item.DirectDownloadUrl }}", "filename": "{{ result.me_file_info.FileName }}"}{{ ',' if not loop.last else '' }}
+      {% endfor %}
+      ]
+
+# --- 4. Execute Python download script --------------------------------------
+# download_sap_files.py handles: session-based auth, redirect following,
+# progress tracking, skip-if-exists, HTML error page detection, and
+# automatic cleanup of small files (<50KB) that are likely error pages.
+- name: Download files using Python script
+  ansible.builtin.script:
+    cmd: >
+      download_sap_files.py
+      '{{ downloadbasket_username }}'
+      '{{ downloadbasket_password }}'
+      '{{ downloadbasket_destination }}'
+      '{{ downloadbasket_timeout }}'
+      '{{ download_files_json | to_json }}'
+  register: download_result
+  
+- name: Show download output
+  ansible.builtin.debug:
+    var: download_result.stdout_lines
+
+# --- 5. Post-download: Fix ownership and permissions -------------------------
+- name: Fix ownership of all downloaded files
+  ansible.builtin.file:
+    path: "{{ downloadbasket_destination }}/{{ item.me_file_info.FileName }}"
+    owner: aktansible
+    group: aktansible
+    mode: '0644'
+  loop: "{{ downloadbasket_files_info.results }}"
+  loop_control:
+    label: "{{ item.me_file_info.FileName }}"
+  when: downloadbasket_files_info.results | length > 0
+
+# Only SAPCAR needs execute permission — it's the SAP archive extraction tool.
+# Other downloaded files are SAR/ZIP archives that SAPCAR will extract.
+- name: Make SAPCAR executable
+  ansible.builtin.file:
+    path: "{{ downloadbasket_destination }}/{{ item.me_file_info.FileName }}"
+    mode: '0755'
+  loop: "{{ downloadbasket_files_info.results }}"
+  loop_control:
+    label: "{{ item.me_file_info.FileName }}"
+  when:
+    - downloadbasket_files_info.results | length > 0
+    - item.me_file_info.FileName is match('SAPCAR.*\\.EXE$', ignorecase=True)

@@ -1,0 +1,52 @@
+---
+# =============================================================================
+# Shared Task: precheck_hana_versions.yml
+# =============================================================================
+# Captures the HANA database version BEFORE a HANA update.
+# Uses `HDB version` command (as <sid>adm) which outputs the HANA revision
+# in format "version: 2.00.070.00.1679989823" — we extract just the version
+# string. The result is persisted as a state file on the Ansible controller
+# so validation_hana_versions.yml can compare BEFORE vs. AFTER.
+#
+# Only runs on HANA hosts (is_hana=true).
+# Included by: 03_maintenance_precheck.yml (when do_hana=true)
+# =============================================================================
+
+- name: "Initialize HANA pre-check facts"
+  set_fact:
+    precheck_hana_version: "{{ precheck_undetermined_version_message }}"
+  when: is_hana | default(false)
+
+- name: "Get HANA Version BEFORE Update"
+  block:
+    - name: "Capture HANA version"
+      shell: |
+        set -o pipefail
+        version=$(su - {{ sap_sid | lower }}adm -c "HDB version | awk '/version:/ {print \$2; exit}'")
+        if [ -z "$version" ]; then
+          echo "version output not found in HDB version" >&2
+          exit 2
+        fi
+        printf '%s\n' "$version"
+      args:
+        executable: /bin/bash
+      register: hana_ver_before
+      changed_when: false
+      failed_when: (hana_ver_before.rc | int) != 0
+
+    - name: "Set HANA version fact"
+      set_fact:
+        precheck_hana_version: "{{ hana_ver_before.stdout | trim }}"
+  rescue:
+    - name: "Mark HANA version as undetermined"
+      set_fact:
+        precheck_hana_version: "{{ precheck_undetermined_version_message }}"
+  when: is_hana | default(false)
+
+- name: "Save HANA BEFORE Version"
+  copy:
+    content: "{{ precheck_hana_version }}\n"
+    dest: "{{ _state_dir }}/hana_ver_before_{{ inventory_hostname }}.txt"
+  delegate_to: localhost
+  become: false
+  when: is_hana | default(false)

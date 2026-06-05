@@ -1,0 +1,388 @@
+{# ==========================================================================
+   Template: maintenance_report.j2
+   ===========================================================================
+   Generates the Markdown maintenance report emailed after each pipeline run.
+
+   Sections:
+     1. Overall Result - aggregated status across all hosts
+     2. Version Changes - BEFORE/AFTER table for kernel, HANA, OS
+     3. Key Executable Versions - detailed per-binary comparison (kernel)
+     4. Per-Host Status - rollback, Icinga health, critical services
+     5. Follow-up Actions - conditional checklist based on failures
+
+   Namespace variables (Jinja2 namespace for cross-loop state):
+     ns.has_critical        - any host has unresolved Icinga alerts
+     ns.has_rollback        - kernel rollback was performed
+     ns.has_hana_failure    - HANA update failed
+     ns.has_backup_failure  - HANA backup failed
+     ns.total_patches       - total OS packages updated across all hosts
+     ns.icinga_skipped      - Icinga checks were disabled for this run
+
+   Input: hostvars from all play hosts (set by validation playbook)
+   ========================================================================== #}
+# SAP MAINTENANCE REPORT
+
+| Field | Value |
+|-------|-------|
+| Pipeline Run | {{ pipeline_run_id | default('local') }} |
+| Start Time | {{ hostvars[ansible_play_hosts[0]].maintenance_start_time | default('N/A') }} |
+| End Time | {{ hostvars[ansible_play_hosts[0]].maintenance_end_time | default('N/A') }} |
+| Update Types | {% if do_kernel | bool %}Kernel {% endif %}{% if do_hana | bool %}HANA {% endif %}{% if do_os_patch | bool %}OS {% endif %}{% if not (do_kernel | bool or do_hana | bool or do_os_patch | bool) %}None{% endif %}|
+| Target Hosts | {{ ansible_play_hosts | join(', ') }} |
+| Executed By | {{ pipeline_requested_by | default('Automation') }} (Pipeline {{ pipeline_run_id | default('local') }}) |
+
+## Active Switch State
+
+| Switch | Value |
+|--------|-------|
+| do_kernel | {{ 'true' if (do_kernel | default(false) | bool) else 'false' }} |
+| do_hana | {{ 'true' if (do_hana | default(false) | bool) else 'false' }} |
+| do_os_patch | {{ 'true' if (do_os_patch | default(false) | bool) else 'false' }} |
+| skip_icinga | {{ 'true' if (skip_icinga | default(false) | bool) else 'false' }} |
+| do_root_keys | {{ 'true' if (do_root_keys | default(false) | bool) else 'false' }} |
+
+{% if skip_icinga | default(false) | bool %}
+> **WARNING:** Monitoring health gate was bypassed for this run.
+{% endif %}
+
+---
+
+{% set ns = namespace(has_critical=false, has_rollback=false, has_hana_failure=false, has_backup_failure=false, total_patches=0, icinga_skipped=false) %}
+{% for host in ansible_play_hosts %}
+{% if hostvars[host].icinga_skipped | default(false) | bool %}{% set ns.icinga_skipped = true %}{% endif %}
+{% endfor %}
+{% for host in ansible_play_hosts %}
+{% set h = hostvars[host] %}
+{% if (not h.icinga_skipped | default(false) | bool) and h.icinga_critical_services | default([]) | length > 0 %}{% set ns.has_critical = true %}{% endif %}
+{% if h.rollback_performed | default(false) | bool %}{% set ns.has_rollback = true %}{% endif %}
+{% if h.hana_update_status | default('SKIPPED') == 'FAILED' %}{% set ns.has_hana_failure = true %}{% endif %}
+{% if h.hana_backup_status | default('SKIPPED') == 'FAILED' %}{% set ns.has_backup_failure = true %}{% endif %}
+{% if h.os_patch_count is defined %}{% set ns.total_patches = ns.total_patches + (h.os_patch_count | int) %}{% endif %}
+{% endfor %}
+## 1. OVERALL RESULT
+
+**Status: {% if ns.has_rollback %}FAILURE (Rollback performed){% elif ns.has_hana_failure %}FAILURE (HANA Update failed){% elif ns.has_backup_failure %}PARTIAL (HANA Backup failed){% elif ns.has_critical %}PARTIAL (Critical services detected){% else %}SUCCESS{% endif %}{% if ns.icinga_skipped %} (Icinga check skipped){% endif %}**
+
+### Version Changes
+
+| Host | Component | Before | After | Status |
+|------|-----------|--------|-------|--------|
+{% for host in ansible_play_hosts | sort %}
+{% set h = hostvars[host] %}
+{% if do_kernel | bool and (h.is_netweaver | default(false) | bool) %}
+| {{ host }} ({{ h.sap_sid | default('N/A') }}) | SAP Kernel | {{ h.version_before | default('N/A') }} | {{ h.version_after | default('N/A') }} | {{ 'UPDATED' if (h.version_before | default('')) != (h.version_after | default('')) else 'UNCHANGED' }} |
+{% endif %}
+{% if do_hana | bool and (h.is_hana | default(false) | bool) %}
+| {{ host }} ({{ h.sap_sid | default('N/A') }}) | HANA Database Services | {{ h.hana_version_before | default('N/A') }} | {{ h.hana_version_after | default('N/A') }} | {{ 'UPDATED' if (h.hana_version_before | default('')) != (h.hana_version_after | default('')) else 'UNCHANGED' }} |
+{% endif %}
+{% if do_hana | bool and (h.is_netweaver | default(false) | bool) and (h.hana_client_version_before is defined or h.hana_client_version_after is defined) %}
+| {{ host }} ({{ h.sap_sid | default('N/A') }}) | HANA Client | {{ h.hana_client_version_before | default('N/A') }} | {{ h.hana_client_version_after | default('N/A') }} | {{ h.hana_client_update_status | default('SKIPPED') }} |
+{% endif %}
+{% if do_os_patch | bool %}
+{% set pkg_count = h.os_patch_count | default(0) | int %}
+| {{ host }} ({{ h.sap_sid | default('N/A') }}) | OS Packages | {{ h.os_version_before | default('-') }} | {{ pkg_count }} packages{% if h.os_reboot_performed | default(false) %} + Reboot{% endif %} | {{ 'UPDATED' if pkg_count > 0 else 'NO UPDATES' }} |
+{% endif %}
+{% endfor %}
+
+{% if do_os_patch | bool and ns.total_patches > 0 %}
+**Total OS Packages Updated:** {{ ns.total_patches }} packages across {{ ansible_play_hosts | length }} host(s)
+{% endif %}
+
+{% if do_kernel | bool %}
+{% for host in ansible_play_hosts | sort %}
+{% set h = hostvars[host] %}
+{% if h.is_netweaver | default(false) | bool and h.key_exe_comparison is defined %}
+{% set exe_list = (h.key_exe_comparison | from_json) if (h.key_exe_comparison is string) else (h.key_exe_comparison | default([])) %}
+{% if exe_list | length > 0 %}
+{% set expected_executables = ['disp+work', 'tp', 'R3trans', 'sapstartsrv', 'sapwebdisp'] %}
+### Key Executable Versions - {{ host }} ({{ h.sap_sid | default('N/A') }})
+
+These are the critical SAP kernel executables. The patch level format is typically `<kernel_release> <patch_number>` (e.g., `7.77 1234`).
+
+| Executable | Before (Patch Level) | After (Patch Level) | Status |
+|-----------|---------------------|---------------------|--------|
+{% for exe_name in expected_executables %}
+{% set exe = ((exe_list | selectattr('name', 'equalto', exe_name) | list | first) | default({})) %}
+| {{ exe_name }} | {{ exe.before | default('N/A') }} | {{ exe.after | default('N/A') }} | {{ 'UPDATED' if (exe.changed | default(false)) else ('UNCHANGED' if (exe | length > 0) else 'UNAVAILABLE') }} |
+{% endfor %}
+
+**Key Executables Explained:**
+- **disp+work**: SAP dialog work process and the primary kernel patch indicator
+- **tp**: Transport control program used for SAP import and export operations
+- **R3trans**: Transport and database connectivity utility used by SAP tooling
+- **sapstartsrv**: SAP Start Service used for instance control and lifecycle operations
+- **sapwebdisp**: SAP Web Dispatcher executable when it is present in the kernel directory
+
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+### Per-Host Status
+
+| Host | Rollback | Icinga Health | Critical Icinga Services |
+|------|----------|---------------|--------------------------|
+{% for host in ansible_play_hosts | sort %}
+{% set h = hostvars[host] %}
+| {{ host }} | {{ 'YES - KERNEL RESTORED' if h.rollback_performed | default(false) | bool else 'No' }} | {{ 'SKIPPED' if h.icinga_skipped | default(false) | bool else ('CRITICAL (' + (h.icinga_critical_services | default([]) | length | string) + ')' if (h.icinga_critical_services | default([]) | length > 0) else 'OK') }} | {{ 'N/A (Icinga skipped)' if h.icinga_skipped | default(false) | bool else (h.icinga_critical_services | default([]) | map(attribute='attrs.display_name') | list | join(', ') if (h.icinga_critical_services | default([]) | length > 0) else '-') }} |
+{% endfor %}
+
+{% for host in ansible_play_hosts | sort %}
+{% set h = hostvars[host] %}
+{% set shared_rows = h.shared_hana_start_results | default([]) %}
+{% if h.hana_shared | default(false) | bool and shared_rows | length > 0 %}
+### Shared HANA Instance and Tenant Detail - {{ host }}
+
+| Instance Nr | Instance Name | Tenant SID | Customer | Pre-Maintenance State | Update Outcome | Post-Maintenance State |
+|-------------|---------------|------------|----------|-----------------------|----------------|------------------------|
+{% for tenant in shared_rows %}
+{% set instance_result = (h.shared_hana_instance_results | default([]) | selectattr('instance_name', 'equalto', tenant.instance_name) | selectattr('instance_nr', 'equalto', tenant.instance_nr) | list | first) | default({}) %}
+{% set outcome_ns = namespace(parts=[]) %}
+{% set lifecycle_state = tenant.post_maintenance_state | default('stopped') | upper %}
+{% set outcome_ns.parts = outcome_ns.parts + [('Lifecycle VERIFIED' if lifecycle_state == 'RUNNING' else 'Lifecycle SKIPPED')] %}
+{% if do_hana | bool %}
+{% set outcome_ns.parts = outcome_ns.parts + ['HANA ' ~ (instance_result.status | default('UNKNOWN'))] %}
+{% endif %}
+{% if do_os_patch | bool %}
+{% set outcome_ns.parts = outcome_ns.parts + ['OS ' ~ ('UPDATED' if (h.os_patch_count | default(0) | int) > 0 else 'NO UPDATES')] %}
+{% endif %}
+| {{ tenant.instance_nr | default('N/A') }} | {{ tenant.instance_name | default('N/A') }} | {{ tenant.sid | default('N/A') }} | {{ tenant.customer | default('N/A') }} | {{ tenant.pre_maintenance_state | default('stopped') | upper }} | {{ outcome_ns.parts | join('; ') if outcome_ns.parts | length > 0 else 'NO UPDATE SELECTED' }} | {{ lifecycle_state }} |
+{% endfor %}
+
+{% if h.shared_hana_halt_remaining_updates | default(false) | bool %}
+> **NOTE:** Remaining shared HANA instance updates on {{ host }} were halted. {{ h.shared_hana_halt_remaining_updates_reason | default('') }}
+{% endif %}
+
+{% endif %}
+{% endfor %}
+
+{% if ns.has_critical %}
+> **NOTE:** If services are not green after the stabilization period, please check within 2 hours if Icinga is green again, as the downtime will be reset after 2 hours.
+{% endif %}
+
+{% if ns.has_critical or ns.has_rollback or ns.has_hana_failure or ns.has_backup_failure %}
+### Follow-up Actions
+
+{% if ns.has_rollback %}
+- [ ] Investigate kernel update failure (check staging directory)
+- [ ] Verify SAP system is running with restored kernel (`sapcontrol -function GetProcessList`)
+- [ ] Plan retry after resolving issues
+{% endif %}
+{% if ns.has_hana_failure %}
+- [ ] Check hdblcm log on HANA host (`/var/tmp/hdb_*_hdblcm_update_*/hdblcm.log`)
+- [ ] Verify HANA system is running (`HDB info`)
+- [ ] Review update medium in staging directory
+{% endif %}
+{% if ns.has_backup_failure %}
+- [ ] Verify HANA authentication (`hdbuserstore list`)
+- [ ] Check backup logs and retry manually if needed
+{% endif %}
+{% if ns.has_critical %}
+- [ ] Check Icinga dashboard for critical service details
+- [ ] Review SAP work process logs (`dev_w*`, `dev_disp`)
+- [ ] Contact SAP Basis team if services do not recover
+{% endif %}
+{% else %}
+{% if ns.icinga_skipped %}
+- [ ] Icinga health check was skipped — verify service status manually in Icinga dashboard
+{% else %}
+No follow-up actions required. All systems operational.
+{% endif %}
+{% endif %}
+
+---
+
+## 2. EXECUTION DETAILS
+
+{% for host in ansible_play_hosts | sort %}
+{% set h = hostvars[host] %}
+### {{ host }} (SID: {{ h.sap_sid | default('N/A') }}, {% if h.is_netweaver | default(false) | bool %}NetWeaver Application Server{% elif h.is_hana | default(false) | bool %}HANA Database Server{% else %}Unknown Type{% endif %})
+
+| Task | Result | Details |
+|------|--------|---------|
+{% if do_os_patch | bool %}
+{% set pkg_count = h.os_patch_count | default(0) | int %}
+| OS Patching | {{ 'APPLIED' if pkg_count > 0 else 'SKIPPED (no updates)' }} | {{ pkg_count }} packages{% if h.os_reboot_performed | default(false) %} + Reboot{% endif %} |
+{% endif %}
+{% if do_hana | bool and (h.is_hana | default(false) | bool) %}
+| HANA Backup | {{ h.hana_backup_status | default('SKIPPED') }} | {{ h.hana_backup_databases | default('SYSTEMDB') if h.hana_backup_status | default('SKIPPED') != 'SKIPPED' else 'Not executed' }} |
+{% if h.hana_backup_error | default('') | length > 0 %}
+| **Backup Error** | FAILED | {{ h.hana_backup_error | replace('\n', ' ') | truncate(200) }} |
+{% endif %}
+| HANA Update | {{ h.hana_update_status | default('SKIPPED') }} | Database software update |
+{% if h.hana_update_error | default('') | length > 0 %}
+| **Update Error** | FAILED | {{ h.hana_update_error | replace('\n', ' ') | truncate(200) }} |
+{% endif %}
+{% if do_root_keys | default(false) | bool %}
+| Encryption Root Keys | {{ h.root_keys_status | default('SKIPPED') }} | LSS backup password |
+{% endif %}
+| SYSTEM User | {{ 'Deactivated' if h.system_user_deactivated | default(false) | bool else 'NOT deactivated' }} | Security cleanup |
+| MAINTENANCE Key | {{ 'Removed' if h.maintenance_key_removed | default(false) | bool else 'Kept (preexisting auth)' }} | hdbuserstore cleanup |
+{% endif %}
+{% if do_hana | bool and (h.is_netweaver | default(false) | bool) and (h.hana_client_update_status is defined) %}
+| HANA Client Update | {{ h.hana_client_update_status | default('SKIPPED') }} | via hdbinst on application server |
+{% if h.hana_client_update_error | default('') | length > 0 %}
+| **Client Error** | FAILED | {{ h.hana_client_update_error | replace('\n', '<br>') | truncate(200) }} |
+{% endif %}
+{% endif %}
+{% if do_kernel | bool and (h.is_netweaver | default(false) | bool) %}
+| Kernel Update | {{ 'ROLLBACK PERFORMED' if h.rollback_performed | default(false) | bool else 'SUCCESS' }} | SAP kernel binaries |
+{% if h.rollback_error | default('') | length > 0 %}
+| **Rollback Reason** | FAILED | {{ h.rollback_error | replace('\n', '<br>') }} |
+{% endif %}
+{% if h.kernel_backup_path is defined and h.kernel_backup_path and 'N/A' not in (h.kernel_backup_path | default('N/A')) %}
+| Kernel Backup Location | N/A | {{ h.kernel_backup_path }} |
+{% endif %}
+{% endif %}
+
+{% endfor %}
+
+---
+
+## 3. PRE-MAINTENANCE STATE
+
+{% for host in ansible_play_hosts | sort %}
+{% set h = hostvars[host] %}
+### {{ host }} (SID: {{ h.sap_sid | default('N/A') }})
+
+| Property | Value |
+|----------|-------|
+| SAP Type | {% if h.is_netweaver | default(false) | bool %}NetWeaver Application Server{% elif h.is_hana | default(false) | bool %}HANA Database Server{% else %}Unknown{% endif %} |
+{% if do_kernel | bool and (h.is_netweaver | default(false) | bool) %}
+| Kernel Patch Level (Before) | {{ h.version_before | default('N/A') }} |
+{% endif %}
+{% if do_hana | bool and (h.is_hana | default(false) | bool) %}
+| HANA Version (Before) | {{ h.hana_version_before | default('N/A') }} |
+{% endif %}
+{% if do_hana | bool and (h.is_netweaver | default(false) | bool) and (h.hana_client_version_before is defined) %}
+| HANA Client Version (Before) | {{ h.hana_client_version_before | default('N/A') }} |
+{% endif %}
+| System Status | Running (Pre-Check passed) |
+| Icinga Health Gate | {{ 'SKIPPED (Icinga check not performed)' if h.icinga_skipped | default(false) | bool else 'OK (No critical services)' }} |
+
+{% endfor %}
+
+---
+
+## 4. POST-MAINTENANCE STATE
+
+{% for host in ansible_play_hosts | sort %}
+{% set h = hostvars[host] %}
+### {{ host }} (SID: {{ h.sap_sid | default('N/A') }})
+
+| Property | Value |
+|----------|-------|
+| SAP Type | {% if h.is_netweaver | default(false) | bool %}NetWeaver Application Server{% elif h.is_hana | default(false) | bool %}HANA Database Server{% else %}Unknown{% endif %} |
+{% if do_kernel | bool and (h.is_netweaver | default(false) | bool) %}
+| Kernel Patch Level (After) | {{ h.version_after | default('N/A') }} |
+{% endif %}
+{% if do_hana | bool and (h.is_hana | default(false) | bool) %}
+| HANA Version (After) | {{ h.hana_version_after | default('N/A') }} |
+{% endif %}
+{% if do_hana | bool and (h.is_netweaver | default(false) | bool) and (h.hana_client_version_after is defined) %}
+| HANA Client Version (After) | {{ h.hana_client_version_after | default('N/A') }} |
+{% endif %}
+{% if do_os_patch | bool %}
+| OS Packages Updated | {{ h.os_patch_count | default(0) }} |
+{% if h.os_reboot_performed | default(false) %}
+| Reboot Performed | Yes |
+{% endif %}
+{% endif %}
+| System Status | {{ 'Running' if not (h.rollback_performed | default(false) | bool) else 'ROLLBACK PERFORMED' }} |
+| Icinga Health | {{ 'SKIPPED (not checked)' if h.icinga_skipped | default(false) | bool else ('OK' if (h.icinga_critical_services | default([]) | length == 0) else 'CRITICAL (' + (h.icinga_critical_services | length | string) + ' services)') }} |
+
+{% endfor %}
+
+{% if do_kernel | bool %}
+---
+
+## 5. KERNEL CHANGE LOG
+
+{% for host in ansible_play_hosts | sort %}
+{% set h = hostvars[host] %}
+{% if h.is_netweaver | default(false) | bool and h.kernel_change_log is defined %}
+### {{ host }} (SID: {{ h.sap_sid | default('N/A') }}) - /usr/sap/{{ h.sap_sid }}/SYS/exe/run
+
+{% set changelog = (h.kernel_change_log | from_json) if (h.kernel_change_log is string) else (h.kernel_change_log | default([])) %}
+{% set changed_files = changelog | selectattr('status', 'equalto', 'CHANGED') | list %}
+{% set new_files = changelog | selectattr('status', 'equalto', 'NEW') | list %}
+{% set removed_files = changelog | selectattr('status', 'equalto', 'REMOVED') | list %}
+{% set unchanged_files = changelog | selectattr('status', 'equalto', 'UNCHANGED') | list %}
+**Summary:** {{ changed_files | length }} updated, {{ new_files | length }} new, {{ removed_files | length }} removed, {{ unchanged_files | length }} unchanged ({{ changelog | length }} total files)
+
+<details>
+<summary>Updated/New/Removed files ({{ changed_files | length + new_files | length + removed_files | length }})</summary>
+
+| File | Status |
+|------|--------|
+{% for entry in changelog | sort(attribute='file') %}
+{% if entry.status != 'UNCHANGED' %}
+| {{ entry.file }} | {{ entry.status }} |
+{% endif %}
+{% endfor %}
+
+</details>
+
+<details>
+<summary>Unchanged files ({{ unchanged_files | length }})</summary>
+
+| File | Status |
+|------|--------|
+{% for entry in unchanged_files | sort(attribute='file') %}
+| {{ entry.file }} | UNCHANGED |
+{% endfor %}
+
+</details>
+
+{% endif %}
+{% endfor %}
+{% endif %}
+
+{% if do_os_patch | bool %}
+---
+
+## 6. OS PATCH CHANGE LOG
+
+{% for host in ansible_play_hosts | sort %}
+{% set h = hostvars[host] %}
+### {{ host }}
+
+{% set pkg_count = h.os_patch_count | default(0) | int %}
+{% if pkg_count == 0 %}
+**No updates available** - System was already up to date.
+{% elif h.os_packages_updated is defined and h.os_packages_updated | length > 0 %}
+**{{ pkg_count }} packages updated:**
+
+| Package |
+|---------|
+{% for pkg in h.os_packages_updated %}
+| {{ pkg if pkg is string else pkg.name }} |
+{% endfor %}
+
+{% if h.os_reboot_performed | default(false) %}
+**Reboot performed:** Yes
+{% endif %}
+{% else %}
+**{{ pkg_count }} packages updated** (package list not captured)
+{% endif %}
+
+{% endfor %}
+{% endif %}
+
+---
+
+## GLOSSARY
+
+| Term | Explanation |
+|------|-------------|
+| **Kernel Patch Level** | Format: `<release> <patch>` (e.g., `7.77 1234`). Higher patch number = newer. |
+| **Process Count (e.g., 11/11)** | SAP process status indicator. Format: "running/total". GREEN when all match (e.g., 11/11), WARNING otherwise. Click "Process Details" in Host Info report to see individual process states. |
+| **Rollback** | Automatic restore of kernel backup when SAP start fails after update. |
+| **Icinga Health Gate** | Pre-check that blocks maintenance if critical monitoring alerts exist. |
+| **HANA Backup** | Full backup of SYSTEMDB + all active tenant databases before HANA update. |
+| **Root Keys** | HANA encryption root keys backup password for data recovery. |
+
+---
+
+Report generated: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+Generated by: SAP Maintenance Automation Framework (Pipeline {{ pipeline_run_id | default('local') }})

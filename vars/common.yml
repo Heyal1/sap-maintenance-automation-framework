@@ -1,0 +1,114 @@
+---
+# ============================================================================
+# SAP Kernel Update - Central Configuration
+# ============================================================================
+# Purpose: Central definition of timeouts, paths, and constants
+# Used by: All playbooks (01_assess, 02_staging, 03_maintenance)
+# ============================================================================
+
+# SAP System Control Timeouts
+# ----------------------------------------------------------------------------
+# How long to wait for SAP system stop/start operations
+sap_stop_timeout_seconds: 600        # 10 minutes max for SAP stop
+sap_start_timeout_seconds: 900       # 15 minutes max for SAP start
+
+# Status check polling configuration (for Stop operations)
+sap_status_check_retries: 60         # Number of retry attempts
+sap_status_check_delay_seconds: 10   # Wait 10 seconds between checks
+                                      # Total max wait: 60 × 10 = 600s = 10 min
+
+# Status check polling configuration (for Start operations - longer timeout)
+sap_start_check_retries: 90          # Number of retry attempts for start
+                                      # Total max wait: 90 × 10 = 900s = 15 min
+
+# Process verification after start (for APP servers)
+sap_process_verify_retries: 10       # Check 10 times
+sap_process_verify_delay_seconds: 6  # Wait 6 seconds between checks
+                                      # Total wait: 10 × 6 = 60s = 1 min
+
+# SAP system status values (from sapcontrol)
+sap_status_stopped: ['GRAY', 'SAPControl-GRAY']
+sap_status_running: ['GREEN', 'SAPControl-GREEN']
+sap_status_yellow: ['YELLOW', 'SAPControl-YELLOW']
+
+# Icinga Downtime Configuration
+# ----------------------------------------------------------------------------
+# NOTE: Downtime duration is now controlled via pipeline parameter (downtime_duration_minutes)
+# The parameter is passed directly to the API call - no complex calculation needed.
+icinga_author_prefix: "Ansible_Automation"
+
+# Smart Pause (for isolated downtime testing)
+icinga_verification_pause_minutes: 3
+
+# Post-Validation: Wartezeit bevor Icinga Health Gate prueft (in Sekunden)
+# Gibt SAP-Systemen Zeit zur Stabilisierung nach Neustart (Buffer, CCMS, etc.)
+icinga_post_validation_pause_seconds: 600
+
+# Icinga Health Gate: Service Excludes
+# ----------------------------------------------------------------------------
+# Passed at pipeline runtime via exclude_icinga_services_sap / exclude_icinga_services_hana.
+# No hardcoded prefixes — every exclusion must be explicit per pipeline run.
+icinga_exclude_service_prefixes: []
+
+# Directory Paths
+# ----------------------------------------------------------------------------
+# Controller staging directories (local to Ansible controller)
+# All staging happens under this base path - NOT in OS root (/)
+controller_staging_base: "/home/aktansible/sap_staging"
+controller_staging_source: "{{ controller_staging_base }}/source"
+controller_staging_prepared: "{{ controller_staging_base }}/prepared"
+
+# Controller temp state directory for cross-stage data persistence
+controller_state_base: "/home/aktansible/tmp"
+
+# Remove run-scoped maintenance state directories older than this many days.
+state_retention_days: 30
+
+# Remote staging directory on SAP servers
+# Uses /usr/sap/tmp/ as it's the SAP standard temp location, accessible by root and <sid>adm.
+# Standard paths (no run_id suffix - matches SAP Ansible Collection expectations):
+#   kernel:    /usr/sap/tmp/staging/kernel/
+#   hana:      /usr/sap/tmp/staging/hana/
+#   hostagent: /usr/sap/tmp/staging/hostagent/
+remote_staging_dir: "/usr/sap/tmp/staging"
+remote_hana_staging_dir: "/usr/sap/tmp/staging"
+remote_hostagent_staging_dir: "/usr/sap/tmp/staging"
+
+# Staging cleanup: Remove prepared directories older than this (days)
+staging_cleanup_age_days: 7
+
+# Backup directory for kernel backups
+# NOTE: The sap_kernel_update role creates backups relative to sap_kernel_update_kernel_path
+# (e.g., /usr/sap/SID/SYS/exe/run-<timestamp>). This variable is for custom backup logic only.
+backup_base_dir: "/usr/sap/backup/kernel"
+
+# OS Patching Configuration
+# ----------------------------------------------------------------------------
+os_patching_log_file: "{{ playbook_dir }}/../ansible_os_update.log"
+
+# Kernel Update Configuration
+# ----------------------------------------------------------------------------
+# Clean IPC resources after kernel update
+sap_kernel_update_clean_ipc: true
+
+# Run saproot script after kernel update
+sap_kernel_update_run_saproot: true
+
+# Process Detection Patterns
+# ----------------------------------------------------------------------------
+# Regex patterns for SAP process detection (used in runtime detection)
+netweaver_process_pattern: 'disp\+work|msg_server|enserver'
+hana_feature_pattern: 'HDB'
+webdispatcher_process_pattern: 'sapwebdisp'
+
+# File Pattern Classification for Staging
+# ----------------------------------------------------------------------------
+# Regex patterns to categorize downloaded SAR files by type
+kernel_file_patterns: 'SAPEXE|SAPEXEDB|dw_|sapnwrfc'
+hana_file_patterns: 'IMDB_SERVER|IMDB_CLIENT'
+hostagent_file_patterns: 'SAPHOSTAGENT'
+
+# Email Configuration
+# ----------------------------------------------------------------------------
+email_default_recipient: "sap-operations@example.invalid"
+email_sender: "sap.automation@example.invalid"

@@ -1,0 +1,74 @@
+---
+# =============================================================================
+# Shared Task: shared_hana_stop_app_host.yml
+# =============================================================================
+# Captures and stops one application host attached to a shared HANA tenant.
+# =============================================================================
+
+- name: "Discover shared app host facts for SID {{ shared_hana_tenant_ctx.sid }} on {{ shared_hana_app_host }}"
+  sap.sap_operations.host_info:
+  delegate_to: "{{ shared_hana_app_host }}"
+  register: _shared_hana_app_host_info
+  failed_when: >-
+    (_shared_hana_app_host_info.msg is defined and 'SOAP' in (_shared_hana_app_host_info.msg | upper))
+    or (_shared_hana_app_host_info.instances | default([]) | length == 0)
+
+- name: "Summarize shared app host state for SID {{ shared_hana_tenant_ctx.sid }} on {{ shared_hana_app_host }}"
+  set_fact:
+    _shared_hana_app_host_processes: "{{ _shared_hana_app_host_info.instances | default([]) | map(attribute='ProcessList') | select('defined') | flatten | list }}"
+    _shared_hana_app_host_nonstopped_process_count: >-
+      {{
+        _shared_hana_app_host_info.instances | default([])
+        | map(attribute='ProcessList')
+        | select('defined')
+        | flatten
+        | rejectattr('dispstatus', 'equalto', 'SAPControl-GRAY')
+        | rejectattr('dispstatus', 'equalto', 'GRAY')
+        | list
+        | length
+      }}
+    _shared_hana_app_host_instance_number: "{{ _shared_hana_app_host_info.instances[0].mSystemNumber | default('00') }}"
+    _shared_hana_app_host_sid: "{{ hostvars[shared_hana_app_host].sap_sid | default(shared_hana_tenant_ctx.sid) }}"
+    _shared_hana_app_host_was_running: >-
+      {{
+        (
+          _shared_hana_app_host_info.instances | default([])
+          | map(attribute='ProcessList')
+          | select('defined')
+          | flatten
+          | rejectattr('dispstatus', 'equalto', 'SAPControl-GRAY')
+          | rejectattr('dispstatus', 'equalto', 'GRAY')
+          | list
+          | length
+        ) > 0
+      }}
+
+- name: "Record shared app host state for SID {{ shared_hana_tenant_ctx.sid }} on {{ shared_hana_app_host }}"
+  set_fact:
+    _shared_tenant_app_host_states: >-
+      {{
+        _shared_tenant_app_host_states
+        + [
+          {
+            'host': shared_hana_app_host,
+            'sid': _shared_hana_app_host_sid,
+            'instance_number': _shared_hana_app_host_instance_number,
+            'pre_maintenance_state': 'running' if (_shared_hana_app_host_was_running | bool) else 'stopped',
+            'was_running': _shared_hana_app_host_was_running | bool,
+            'process_count_total': _shared_hana_app_host_processes | length,
+            'process_count_nonstopped': _shared_hana_app_host_nonstopped_process_count | int
+          }
+        ]
+      }}
+
+- name: "Stop shared application host {{ shared_hana_app_host }} for SID {{ shared_hana_tenant_ctx.sid }}"
+  sap.sap_operations.system:
+    instance_number: "{{ _shared_hana_app_host_instance_number }}"
+    name: "ALL"
+    state: stopped
+    wait: true
+    wait_timeout: "{{ sap_stop_timeout_seconds }}"
+  delegate_to: "{{ shared_hana_app_host }}"
+  when:
+    - _manage_application_lifecycle | default(false) | bool
+    - _shared_hana_app_host_was_running | default(false) | bool

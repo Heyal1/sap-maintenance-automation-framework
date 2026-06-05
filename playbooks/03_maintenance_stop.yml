@@ -1,0 +1,172 @@
+# ============================================================================
+# SAP Maintenance: Stop SAP + HANA Systems
+# ============================================================================
+# Consolidated lifecycle stop stage for maintenance runs.
+#
+# Sequence: record pre-maintenance state → stop application instances first
+# → stop database instances second.
+#
+# Pipeline Stage: StopApplications
+# ============================================================================
+
+- name: "SAP Maintenance: Stop SAP + HANA Systems"
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    do_kernel: false
+    do_hana: false
+    do_os_patch: false
+    inject_failure_stop: false
+
+  vars_files:
+    - ../vars/common.yml
+
+  tasks:
+    - name: "Skip stop workflow for precheck-only runs"
+      meta: end_play
+      when: not ((do_kernel | bool) or (do_hana | bool) or (do_os_patch | bool))
+
+    - name: "Run stop workflow"
+      block:
+        - name: "Log active switch values"
+          include_tasks: tasks/log_switch_state.yml
+
+        - name: "Run shared SAP discovery"
+          include_tasks: tasks/discover_sap_facts.yml
+
+        - name: "Determine lifecycle scope for selected update types"
+          set_fact:
+            _is_shared_hana_host: "{{ (hana_shared | default(false) | bool) and (is_hana | default(false) | bool) and not (is_netweaver | default(false) | bool) }}"
+            _manage_application_lifecycle: "{{ (do_kernel | bool) or (do_hana | bool) or (do_os_patch | bool) }}"
+            _manage_database_lifecycle: "{{ (do_hana | bool) or (do_os_patch | bool) }}"
+            _manage_host_lifecycle: >-
+              {{
+                ((_is_shared_hana_host | default(false) | bool) and ((do_kernel | bool) or (do_hana | bool) or (do_os_patch | bool)))
+                or
+                ((is_netweaver | default(false)) and ((do_kernel | bool) or (do_hana | bool) or (do_os_patch | bool)))
+                or
+                ((is_hana | default(false)) and not (is_netweaver | default(false)) and ((do_hana | bool) or (do_os_patch | bool)))
+              }}
+
+        - name: "Skip hosts outside the selected lifecycle scope"
+          meta: end_host
+          when: not (_manage_host_lifecycle | bool)
+
+        - name: "Inject stop failure"
+          fail:
+            msg: "Injected stop failure for rescue path validation."
+          when: inject_failure_stop | bool
+
+        - name: "Build shared HANA lifecycle contexts"
+          include_tasks: tasks/build_shared_hana_instance_contexts.yml
+          when: _is_shared_hana_host | default(false) | bool
+
+        - name: "Run shared HANA stop workflow"
+          include_tasks: tasks/shared_hana_stop_instance.yml
+          loop: "{{ shared_hana_instance_contexts | default([]) }}"
+          loop_control:
+            loop_var: shared_hana_instance_ctx
+            label: "{{ shared_hana_instance_ctx.instance_name }}"
+          when: _is_shared_hana_host | default(false) | bool
+
+        - name: "Ensure run-scoped state directory exists"
+          include_tasks: tasks/create_state_directory.yml
+          when: not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Summarize pre-maintenance process state"
+          set_fact:
+            _pre_maintenance_processes: "{{ sap_info.instances | default([]) | map(attribute='ProcessList') | select('defined') | flatten | list }}"
+            _pre_maintenance_nonstopped_process_count: >-
+              {{
+                sap_info.instances | default([])
+                | map(attribute='ProcessList')
+                | select('defined')
+                | flatten
+                | rejectattr('dispstatus', 'equalto', 'SAPControl-GRAY')
+                | rejectattr('dispstatus', 'equalto', 'GRAY')
+                | list
+                | length
+              }}
+          when: not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Derive pre-maintenance state"
+          set_fact:
+            _pre_maintenance_total_process_count: "{{ _pre_maintenance_processes | length }}"
+            _pre_maintenance_was_running: "{{ (_pre_maintenance_nonstopped_process_count | int) > 0 }}"
+            _pre_maintenance_state: >-
+              {{
+                'running'
+                if (_pre_maintenance_nonstopped_process_count | int) > 0
+                else 'stopped'
+              }}
+          when: not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Persist pre-maintenance instance state"
+          copy:
+            content: |-
+              {{
+                {
+                  'sid': sap_sid,
+                  'host': inventory_hostname,
+                  'component_role': (
+                    'application'
+                    if (is_netweaver | default(false) | bool)
+                    else ('database' if (is_hana | default(false) | bool) else 'unknown')
+                  ),
+                  'recorded_at': ansible_date_time.iso8601,
+                  'pre_maintenance_state': _pre_maintenance_state,
+                  'was_running': _pre_maintenance_was_running | bool,
+                  'process_count_total': _pre_maintenance_total_process_count | int,
+                  'process_count_nonstopped': _pre_maintenance_nonstopped_process_count | int
+                } | to_nice_yaml(indent=2)
+              }}
+            dest: "{{ _state_dir }}/instance_state.yml"
+            mode: '0644'
+          delegate_to: localhost
+          become: false
+          when: not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Stop NetWeaver application instances"
+          sap.sap_operations.system:
+            instance_number: "{{ anchor_instance_nr }}"
+            name: "ALL"
+            state: stopped
+            wait: true
+            wait_timeout: "{{ sap_stop_timeout_seconds }}"
+          when:
+            - is_netweaver | default(false)
+            - _manage_application_lifecycle | default(false) | bool
+            - _pre_maintenance_was_running | default(false) | bool
+            - not (_is_shared_hana_host | default(false) | bool)
+
+        - name: "Stop HANA database instances"
+          sap.sap_operations.system:
+            instance_number: "{{ sap_info.instances[0].mSystemNumber }}"
+            state: stopped
+            wait: true
+            wait_timeout: "{{ sap_stop_timeout_seconds }}"
+          when:
+            - is_hana | default(false)
+            - not (is_netweaver | default(false))
+            - _manage_database_lifecycle | default(false) | bool
+            - _pre_maintenance_was_running | default(false) | bool
+            - not (_is_shared_hana_host | default(false) | bool)
+      rescue:
+        - name: "Capture stop failure context"
+          set_fact:
+            _stop_stage_failed: true
+            _stop_error_task: "{{ ansible_failed_task.name | default('Unknown task') }}"
+            _stop_error_message: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown error'))) }}"
+            _stop_error_details: "{{ ansible_failed_result | default({}) | to_nice_yaml }}"
+        - name: "Send stop failure notification"
+          include_tasks: tasks/send_error_notification.yml
+          vars:
+            _error_stage: "Stop Applications"
+            _error_task: "{{ _stop_error_task }}"
+            _error_host: "{{ inventory_hostname }}"
+            _error_message: >-
+              Task "{{ _stop_error_task }}" failed: {{ _stop_error_message }}
+              Restart outcome: not attempted.
+            _error_details: "{{ _stop_error_details }}"

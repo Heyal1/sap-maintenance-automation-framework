@@ -1,0 +1,44 @@
+---
+# =============================================================================
+# Shared Task: build_shared_hana_instance_contexts.yml
+# =============================================================================
+# Normalizes the shared-host inventory model into ordered instance contexts for
+# stop/start lifecycle operations. Sandbox tenants are treated as the lowest
+# tier so they run before DEV in stop order and after DEV in start order.
+# =============================================================================
+
+- name: "Build shared HANA lifecycle contexts"
+  set_fact:
+    shared_hana_instance_contexts: >-
+      {%- set tier_rank = {'sbx': 0, 'dev': 1, 'qas': 2, 'prd': 3} -%}
+      {%- set ns = namespace(items=[]) -%}
+      {%- for inst in hana_instances | default([]) -%}
+        {%- set tenant_ns = namespace(items=[]) -%}
+        {%- for tenant in inst.tenants | default([]) -%}
+          {%- set tenant_tier = tenant.update_tier | default('dev') | string | lower -%}
+          {%- set tenant_ns.items = tenant_ns.items + [
+            {
+              'sid': tenant.sid,
+              'customer': tenant.customer,
+              'update_tier': tenant_tier,
+              'tier_rank': tier_rank.get(tenant_tier, 1),
+              'app_hosts': tenant.app_hosts | default([]) | unique | list,
+              'icinga_services': tenant.icinga_services | default([])
+            }
+          ] -%}
+        {%- endfor -%}
+        {%- set ordered_tenants = tenant_ns.items | sort(attribute='tier_rank') -%}
+        {%- set tenant_ranks = ordered_tenants | map(attribute='tier_rank') | list -%}
+        {%- set instance_rank = (tenant_ranks | max) if (tenant_ranks | length) > 0 else 1 -%}
+        {%- set instance_tier = ((tier_rank | dict2items | selectattr('value', 'equalto', instance_rank) | map(attribute='key') | list | first) | default('dev')) -%}
+        {%- set ns.items = ns.items + [
+          {
+            'instance_name': inst.instance_name,
+            'instance_nr': inst.instance_nr,
+            'instance_tier': instance_tier,
+            'instance_tier_rank': instance_rank,
+            'tenants': ordered_tenants
+          }
+        ] -%}
+      {%- endfor -%}
+      {{ ns.items | sort(attribute='instance_tier_rank') }}

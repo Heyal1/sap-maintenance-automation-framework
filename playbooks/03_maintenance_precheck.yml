@@ -1,0 +1,373 @@
+# ============================================================================
+# SAP Maintenance: Pre-Check
+# ============================================================================
+# Detects SAP instances, captures BEFORE versions (if update active),
+# and checks Icinga service status.
+# Pipeline Stage: 1. PreCheck
+# ============================================================================
+- name: "SAP Maintenance: Pre-Check"
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    do_kernel: false
+    do_hana: false
+    do_os_patch: false
+    inject_failure_precheck: false
+    precheck_undetermined_version_message: "Version could not be determined"
+
+  vars_files:
+    - ../vars/common.yml
+
+  tasks:
+    - name: "Run pre-check workflow"
+      block:
+        - name: "Log active switch values"
+          include_tasks: tasks/log_switch_state.yml
+
+        - name: "Run shared SAP discovery"
+          include_tasks: tasks/discover_sap_facts.yml
+
+        - name: "Validate inventory data at ingestion"
+          include_tasks: tasks/validate_inventory_data.yml
+
+        - name: "Fail if inventory data is invalid"
+          fail:
+            msg: |
+              PRE-CHECK FAILED: Inventory data is invalid.
+              Maintenance cannot continue until the following inventory issues are resolved:
+
+              {% for issue in precheck_inventory_validation_issues | default([]) %}
+              - {{ issue.component }}: {{ issue.reason }}
+              {% endfor %}
+          when: (precheck_inventory_validation_issues | default([]) | length) > 0
+
+        - name: "Run Icinga discovery"
+          include_tasks: tasks/discover_icinga_facts.yml
+          when: not (skip_icinga | default(false) | bool)
+
+        - name: "Ensure run-scoped state directory exists for dedicated host"
+          include_tasks: tasks/create_state_directory.yml
+          when: not (hana_shared | default(false) | bool)
+
+        - name: "Ensure run-scoped state directory exists for shared host"
+          include_tasks: tasks/create_state_directory.yml
+          vars:
+            target_state_sid: SHARED
+          when: hana_shared | default(false) | bool
+
+        - name: "Inject pre-check failure"
+          fail:
+            msg: "Injected pre-check failure for rescue path validation."
+          when: inject_failure_precheck | bool
+
+        - name: "Set Kernel Variables"
+          set_fact:
+            sap_exe_path: "/usr/sap/{{ sap_sid }}/SYS/exe/run"
+          when: sap_info.instances is defined and (is_netweaver | bool)
+
+        - name: "Collect Kernel versions BEFORE"
+          include_tasks: tasks/precheck_kernel_versions.yml
+          when: do_kernel | bool
+
+        - name: "Collect HANA version BEFORE"
+          include_tasks: tasks/precheck_hana_versions.yml
+          when:
+            - do_hana | bool
+            - not (hana_shared | default(false) | bool)
+
+        - name: "Initialize version validation issue list"
+          set_fact:
+            precheck_version_validation_issues: []
+
+        - name: "Initialize pre-check prerequisite issue list"
+          set_fact:
+            precheck_hana_prereq_issues: []
+
+        - name: "Record undetermined SAP kernel patch level"
+          set_fact:
+            precheck_version_validation_issues: "{{ precheck_version_validation_issues + [ {'component': 'SAP Kernel patch level', 'reason': precheck_undetermined_version_message} ] }}"
+          when:
+            - do_kernel | bool
+            - is_netweaver | default(false) | bool
+            - (precheck_kernel_patch_version | default(precheck_undetermined_version_message)) == precheck_undetermined_version_message
+
+        - name: "Record invalid SAP kernel patch level"
+          set_fact:
+            precheck_version_validation_issues: "{{ precheck_version_validation_issues + [ {'component': 'SAP Kernel patch level', 'reason': 'Invalid version value: ' ~ precheck_kernel_patch_version} ] }}"
+          when:
+            - do_kernel | bool
+            - is_netweaver | default(false) | bool
+            - (precheck_kernel_patch_version | default(precheck_undetermined_version_message)) != precheck_undetermined_version_message
+            - not ((precheck_kernel_patch_version | string) is match('^[0-9]+$'))
+
+        - name: "Record undetermined kernel executable versions"
+          set_fact:
+            precheck_version_validation_issues: "{{ precheck_version_validation_issues + [ {'component': 'SAP kernel executable ' ~ item, 'reason': precheck_undetermined_version_message} ] }}"
+          loop:
+            - disp+work
+            - tp
+            - R3trans
+            - sapstartsrv
+            - sapwebdisp
+          when:
+            - do_kernel | bool
+            - is_netweaver | default(false) | bool
+            - (precheck_kernel_key_executable_versions | default({})).get(item, precheck_undetermined_version_message) == precheck_undetermined_version_message
+
+        - name: "Record undetermined HANA version"
+          set_fact:
+            precheck_version_validation_issues: "{{ precheck_version_validation_issues + [ {'component': 'HANA database version', 'reason': precheck_undetermined_version_message} ] }}"
+          when:
+            - do_hana | bool
+            - is_hana | default(false) | bool
+            - (precheck_hana_version | default(precheck_undetermined_version_message)) == precheck_undetermined_version_message
+
+        - name: "Record invalid HANA version"
+          set_fact:
+            precheck_version_validation_issues: "{{ precheck_version_validation_issues + [ {'component': 'HANA database version', 'reason': 'Invalid version value: ' ~ precheck_hana_version} ] }}"
+          when:
+            - do_hana | bool
+            - is_hana | default(false) | bool
+            - (precheck_hana_version | default(precheck_undetermined_version_message)) != precheck_undetermined_version_message
+            - not ((precheck_hana_version | string) is match('^[0-9]+(\.[0-9]+)+$'))
+
+        - name: "Run HANA-specific pre-check prerequisites"
+          include_tasks: tasks/precheck_hana_prerequisites.yml
+          when:
+            - do_hana | bool
+            - not (hana_shared | default(false) | bool)
+
+        - name: "Initialize disk validation issue list"
+          set_fact:
+            precheck_disk_validation_issues: []
+            preflight_disk_results: []
+
+        - name: "Run disk space validation for selected update types"
+          block:
+            - name: "Include shared disk validation"
+              include_tasks: tasks/preflight_disk_check.yml
+          rescue:
+            - name: "Capture disk validation failure"
+              set_fact:
+                precheck_disk_validation_issues: >-
+                  {{
+                    precheck_disk_validation_issues
+                    + [
+                      {
+                        'component': 'Disk space validation',
+                        'reason': ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Disk space validation failed')))
+                      }
+                    ]
+                  }}
+
+        - name: "Run shared-host pre-check workflow"
+          include_tasks: tasks/precheck_shared_hana.yml
+          when: hana_shared | default(false) | bool
+
+        - name: "Icinga Service Status Check"
+          include_role:
+            name: icinga_service_check
+          vars:
+            icinga_url: "{{ icinga_api_url }}"
+            icinga_user: "{{ icinga_api_user }}"
+            icinga_password: "{{ icinga_api_pass }}"
+            exclude_services: "{{ current_exclude_services }}"
+            exclude_service_prefixes: "{{ icinga_exclude_service_prefixes | default([]) }}"
+            target_hostname: "{{ item }}"
+          loop: "{{ icinga_target_list }}"
+          loop_control:
+            label: "{{ item }}"
+          when:
+            - not (hana_shared | default(false) | bool)
+            - not (skip_icinga | default(false) | bool)
+            - icinga_target_list | length > 0
+
+        - name: "Pre-Check Status"
+          debug:
+            msg: |
+              === Icinga Service Status for {{ inventory_hostname }} ===
+              OK ({{ _ok_svc | length }}): {{ _ok_svc | map(attribute='attrs.display_name') | list }}
+              WARNING ({{ _warn_svc | length }}): {{ _warn_svc | map(attribute='attrs.display_name') | list }}
+              CRITICAL/UNKNOWN ({{ _crit_svc | length }}): {{ _crit_svc | map(attribute='attrs.display_name') | list }}
+              Excluded: {{ current_exclude_services | default([]) }}
+          vars:
+            _all_svc: "{{ icinga_api_response.json.results | default([]) | selectattr('attrs.last_check_result', 'defined') | list }}"
+            _ok_svc: "{{ _all_svc | selectattr('attrs.last_check_result.state', 'equalto', 0) | list }}"
+            _warn_svc: "{{ _all_svc | selectattr('attrs.last_check_result.state', 'equalto', 1) | list }}"
+            _crit_svc: "{{ _all_svc | selectattr('attrs.last_check_result.state', 'in', [2, 3]) | list }}"
+          when:
+            - not (hana_shared | default(false) | bool)
+            - not (skip_icinga | default(false) | bool)
+
+        - name: "Build health gate result state"
+          set_fact:
+            precheck_health_gate_result:
+              host: "{{ inventory_hostname }}"
+              sid: "{{ sap_sid | default(inventory_hostname) }}"
+              outcome: >-
+                {%- if skip_icinga | default(false) | bool -%}
+                BYPASSED
+                {%- elif (icinga_critical_services | default([]) | length) > 0 -%}
+                BLOCK
+                {%- else -%}
+                PASS
+                {%- endif -%}
+              skipped: "{{ skip_icinga | default(false) | bool }}"
+              targets: "{{ icinga_target_list | default([]) }}"
+              excluded_services: "{{ current_exclude_services | default([]) }}"
+              ok_services: "{{ _all_svc | selectattr('attrs.last_check_result.state', 'equalto', 0) | map(attribute='attrs.display_name') | list }}"
+              warning_services: "{{ _all_svc | selectattr('attrs.last_check_result.state', 'equalto', 1) | map(attribute='attrs.display_name') | list }}"
+              critical_services: "{{ _all_svc | selectattr('attrs.last_check_result.state', 'in', [2, 3]) | map(attribute='attrs.display_name') | list }}"
+          vars:
+            _all_svc: "{{ icinga_api_response.json.results | default([]) | selectattr('attrs.last_check_result', 'defined') | list }}"
+          when: not (hana_shared | default(false) | bool)
+
+        - name: "Build pre-check version snapshot"
+          set_fact:
+            precheck_version_snapshot:
+              host: "{{ inventory_hostname }}"
+              sid: "{{ sap_sid | default(inventory_hostname) }}"
+              run_id: "{{ pipeline_run_id | default('local') | string }}"
+              kernel:
+                patch_version: "{{ precheck_kernel_patch_version if (do_kernel | bool and is_netweaver | default(false) | bool) else 'SKIPPED' }}"
+                key_executables: "{{ precheck_kernel_key_executable_versions if (do_kernel | bool and is_netweaver | default(false) | bool) else {} }}"
+                inventory_state_file: "kernel_inventory_before_{{ inventory_hostname }}.txt"
+              hana:
+                version: "{{ precheck_hana_version if (do_hana | bool and is_hana | default(false) | bool) else 'SKIPPED' }}"
+                components: "{{ precheck_hana_components if (do_hana | bool and is_hana | default(false) | bool) else [] }}"
+                component_discovery_path: "{{ precheck_hana_component_discovery_path if (do_hana | bool and is_hana | default(false) | bool) else '' }}"
+                component_output: "{{ precheck_hana_component_output if (do_hana | bool and is_hana | default(false) | bool) else '' }}"
+                credential_validation:
+                  ok: "{{ precheck_hana_credential_ok | default(false) | bool if (do_hana | bool and is_hana | default(false) | bool) else false }}"
+                  source: "{{ precheck_hana_credential_source | default('unavailable') if (do_hana | bool and is_hana | default(false) | bool) else 'SKIPPED' }}"
+                  failure_reason: "{{ precheck_hana_credential_failure_reason | default('Credential validation not required.') if (do_hana | bool and is_hana | default(false) | bool) else 'SKIPPED' }}"
+              version_validation:
+                outcome: "{{ 'PASS' if (precheck_version_validation_issues | default([]) | length) == 0 else 'FAIL' }}"
+                issues: "{{ precheck_version_validation_issues | default([]) }}"
+              hana_prerequisites:
+                outcome: "{{ 'PASS' if (precheck_hana_prereq_issues | default([]) | length) == 0 else 'FAIL' }}"
+                issues: "{{ precheck_hana_prereq_issues | default([]) }}"
+          when: not (hana_shared | default(false) | bool)
+
+        - name: "Persist pre-check version snapshot"
+          copy:
+            content: "{{ precheck_version_snapshot | to_nice_yaml }}"
+            dest: "{{ _state_dir }}/precheck_versions.yml"
+          delegate_to: localhost
+          become: false
+          when: not (hana_shared | default(false) | bool)
+
+        - name: "Build disk validation state"
+          set_fact:
+            precheck_disk_validation_state:
+              host: "{{ inventory_hostname }}"
+              sid: "{{ sap_sid | default(inventory_hostname) }}"
+              outcome: >-
+                {%- if (precheck_disk_validation_issues | default([]) | length) > 0 -%}
+                BLOCK
+                {%- elif (preflight_disk_results | default([]) | length) > 0 -%}
+                PASS
+                {%- else -%}
+                SKIPPED
+                {%- endif -%}
+              results: "{{ preflight_disk_results | default([]) }}"
+              issues: "{{ precheck_disk_validation_issues | default([]) }}"
+          when: not (hana_shared | default(false) | bool)
+
+        - name: "Persist disk validation state"
+          copy:
+            content: "{{ precheck_disk_validation_state | to_nice_yaml }}"
+            dest: "{{ _state_dir }}/disk_space_results.yml"
+          delegate_to: localhost
+          become: false
+          when: not (hana_shared | default(false) | bool)
+
+        - name: "Persist health gate state"
+          copy:
+            content: "{{ precheck_health_gate_result | to_nice_yaml }}"
+            dest: "{{ _state_dir }}/health_gate_results.yml"
+          delegate_to: localhost
+          become: false
+          when: not (hana_shared | default(false) | bool)
+
+        - name: "Fail if version information could not be determined"
+          fail:
+            msg: |
+              PRE-CHECK FAILED: Version could not be determined.
+              Maintenance is blocked until the affected versions have been verified by an administrator.
+
+              Affected components:
+              {% for issue in precheck_version_validation_issues %}
+              - {{ issue.component }}: {{ issue.reason }}
+              {% endfor %}
+
+              Operator guidance:
+              - Verify the component binary exists on the target host and is executable.
+              - Confirm the relevant SAP or HANA service is reachable enough to report its version.
+              - Re-run PreCheck after the version baseline has been confirmed.
+          when: precheck_version_validation_issues | length > 0
+
+        - name: "Fail if HANA or shared-host pre-check prerequisites are not satisfied"
+          fail:
+            msg: |
+              PRE-CHECK FAILED: HANA or shared-host prerequisites are not satisfied.
+              Maintenance cannot continue until the following issues are resolved:
+
+              {% for issue in precheck_hana_prereq_issues | default([]) %}
+              - {{ issue.component }}: {{ issue.reason }}
+              {% endfor %}
+          when: (precheck_hana_prereq_issues | default([]) | length) > 0
+
+        - name: "Fail if disk validation did not pass"
+          fail:
+            msg: |
+              PRE-CHECK FAILED: Disk space validation did not pass.
+              {% for issue in precheck_disk_validation_issues | default([]) %}
+              - {{ issue.component }}: {{ issue.reason }}
+              {% endfor %}
+          when: (precheck_disk_validation_issues | default([]) | length) > 0
+
+        - name: "Fail if critical Icinga services exist"
+          fail:
+            msg: |
+              PRE-CHECK FAILED: Critical services detected before maintenance start!
+              Cannot proceed with maintenance while system is unhealthy.
+              Found {{ icinga_critical_services | length }} critical service(s):
+              {{ icinga_critical_services | map(attribute='attrs.display_name') | list | to_nice_yaml }}
+          when:
+            - not (hana_shared | default(false) | bool)
+            - not (skip_icinga | default(false) | bool)
+            - (icinga_critical_services | default([]) | length) > 0
+
+        - name: "Fail if shared-host critical Icinga services exist"
+          fail:
+            msg: |
+              PRE-CHECK FAILED: Critical services detected before maintenance start!
+              Cannot proceed with maintenance while shared-host tenant health gates are blocked.
+              {% for result in precheck_shared_icinga_gate_failures | default([]) %}
+              - SID {{ result.sid }} (targets: {{ result.targets | join(', ') }}):
+                {{ result.critical_services | join(', ') }}
+              {% endfor %}
+          when:
+            - hana_shared | default(false) | bool
+            - not (skip_icinga | default(false) | bool)
+            - (precheck_shared_icinga_gate_failures | default([]) | length) > 0
+      rescue:
+        - name: "Capture pre-check failure context"
+          set_fact:
+            _precheck_stage_failed: true
+            _precheck_error_task: "{{ ansible_failed_task.name | default('Unknown task') }}"
+            _precheck_error_message: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown error'))) }}"
+            _precheck_error_details: "{{ ansible_failed_result | default({}) | to_nice_yaml }}"
+        - name: "Send pre-check failure notification"
+          include_tasks: tasks/send_error_notification.yml
+          vars:
+            _error_stage: "PreCheck"
+            _error_task: "{{ _precheck_error_task }}"
+            _error_host: "{{ inventory_hostname }}"
+            _error_message: >-
+              Task "{{ _precheck_error_task }}" failed: {{ _precheck_error_message }}
+              Restart outcome: not attempted.
+            _error_details: "{{ _precheck_error_details }}"

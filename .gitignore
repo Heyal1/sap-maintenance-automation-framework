@@ -1,0 +1,37 @@
+# Local editor and agent state
+.claude/
+.serena/
+.codex/
+.agents/
+.vscode/
+
+# Local environment and secrets
+.env
+.env.*
+*.vault
+*.vault.yml
+vault*.yml
+inventory/local*.yml
+inventory/*local*.yml
+inventory/private/
+group_vars/
+host_vars/
+
+# Runtime logs and reports
+*.log
+ansible.log
+ansible_*.log
+reports/
+*.retry
+
+# Generated artifacts
+*.html
+*.tmp
+*.bak
+__pycache__/
+*.py[cod]
+.ansible/
+.venv/
+.uv-cache/
+.uv-tools/
+public-export*/

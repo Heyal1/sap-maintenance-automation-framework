@@ -1,0 +1,160 @@
+---
+# =============================================================================
+# Shared Task: precheck_shared_hana.yml
+# =============================================================================
+# Extends PreCheck for HANA shared hosts by flattening the shared inventory
+# model, validating static mappings, validating runtime instance discovery, and
+# persisting per-SID state.
+# =============================================================================
+
+- name: "Initialize shared HANA pre-check collections"
+  set_fact:
+    precheck_shared_sid_contexts: []
+    precheck_shared_instance_results: []
+    precheck_shared_icinga_gate_failures: []
+    precheck_shared_hdb_actual_instances: []
+    precheck_shared_hdb_info_error: ""
+
+- name: "Flatten shared HANA SID contexts"
+  set_fact:
+    precheck_shared_sid_contexts: >-
+      {{
+        precheck_shared_sid_contexts
+        + [
+          {
+            'sid': _shared_tenant.sid,
+            'customer': _shared_tenant.customer,
+            'update_tier': _shared_tenant.update_tier,
+            'app_hosts': _shared_tenant.app_hosts | default([]),
+            'icinga_services': _shared_tenant.icinga_services | default([]),
+            'instance_name': _shared_instance.instance_name,
+            'instance_nr': _shared_instance.instance_nr
+          }
+        ]
+      }}
+  loop: "{{ (hana_instances | default([])) | subelements('tenants') }}"
+  loop_control:
+    loop_var: shared_hana_entry
+    label: "{{ shared_hana_entry.0.instance_name }}:{{ shared_hana_entry.1.sid }}"
+  vars:
+    _shared_instance: "{{ shared_hana_entry.0 }}"
+    _shared_tenant: "{{ shared_hana_entry.1 }}"
+
+- name: "Record missing HANA email recipient for shared SID contexts"
+  set_fact:
+    precheck_hana_prereq_issues: >-
+      {{
+        precheck_hana_prereq_issues
+        + [
+          {
+            'component': 'email_recipient',
+            'reason': 'HANA updates require email_recipient to be set to a value other than none.',
+            'sid': item.sid,
+            'instance_name': item.instance_name,
+            'instance_nr': item.instance_nr
+          }
+        ]
+      }}
+  loop: "{{ precheck_shared_sid_contexts }}"
+  loop_control:
+    label: "{{ item.sid }}"
+  when:
+    - do_hana | default(false) | bool
+    - (email_recipient | default('none') | string | trim | lower) in ['', 'none']
+
+- name: "Record invalid shared-host app_hosts references"
+  set_fact:
+    precheck_hana_prereq_issues: >-
+      {{
+        precheck_hana_prereq_issues
+        + [
+          {
+            'component': 'app_hosts validation',
+            'reason': _shared_app_host_reason,
+            'sid': _shared_sid_ctx.sid,
+            'instance_name': _shared_sid_ctx.instance_name,
+            'instance_nr': _shared_sid_ctx.instance_nr
+          }
+        ]
+      }}
+  loop: "{{ precheck_shared_sid_contexts | subelements('app_hosts', skip_missing=true) }}"
+  loop_control:
+    loop_var: shared_app_host_entry
+    label: "{{ shared_app_host_entry.0.sid }} -> {{ shared_app_host_entry.1 }}"
+  vars:
+    _shared_sid_ctx: "{{ shared_app_host_entry.0 }}"
+    _shared_app_host: "{{ shared_app_host_entry.1 }}"
+    _shared_app_host_reason: >-
+      {%- if not (_shared_app_host in hostvars) -%}
+      SID {{ _shared_sid_ctx.sid }} references app host {{ _shared_app_host }}, but that host is not present in the inventory.
+      {%- else -%}
+      SID {{ _shared_sid_ctx.sid }} references app host {{ _shared_app_host }}, but its inventory sap_sid is {{ hostvars[_shared_app_host].sap_sid | default('undefined') }} instead of {{ _shared_sid_ctx.sid }}.
+      {%- endif -%}
+  when: >-
+    not (_shared_app_host in hostvars)
+    or ((hostvars[_shared_app_host].sap_sid | default('')) != _shared_sid_ctx.sid)
+
+- name: "Collect actual shared HANA instances from HDB info"
+  block:
+    - name: "Extract shared HANA instances from HDB info"
+      shell: |
+        set -o pipefail
+        HDB info | grep -oE '/usr/sap/[A-Z0-9]{3}/HDB[0-9]{2}' | sed 's#/usr/sap/##; s#/HDB#:#' | sort -u
+      args:
+        executable: /bin/bash
+      register: precheck_shared_hdb_info_instances_cmd
+      changed_when: false
+      failed_when: (precheck_shared_hdb_info_instances_cmd.rc | int) != 0
+
+    - name: "Store actual shared HANA instances"
+      set_fact:
+        precheck_shared_hdb_actual_instances: "{{ precheck_shared_hdb_info_instances_cmd.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+        precheck_shared_hdb_info_error: ""
+  rescue:
+    - name: "Capture HDB info validation failure"
+      set_fact:
+        precheck_shared_hdb_actual_instances: []
+        precheck_shared_hdb_info_error: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('HDB info validation failed'))) }}"
+
+- name: "Record shared HANA instances missing from HDB info"
+  set_fact:
+    precheck_hana_prereq_issues: >-
+      {{
+        precheck_hana_prereq_issues
+        + [
+          {
+            'component': 'HDB info validation',
+            'reason': _shared_hdb_info_reason,
+            'sid': item.sid,
+            'instance_name': item.instance_name,
+            'instance_nr': item.instance_nr
+          }
+        ]
+      }}
+  loop: "{{ precheck_shared_sid_contexts }}"
+  loop_control:
+    label: "{{ item.sid }}"
+  vars:
+    _shared_hdb_instance_id: "{{ item.instance_name ~ ':' ~ item.instance_nr }}"
+    _shared_hdb_info_reason: >-
+      {%- if (precheck_shared_hdb_info_error | default('') | length) > 0 -%}
+      SID {{ item.sid }} expects instance {{ item.instance_name }} (HDB{{ item.instance_nr }}), but HDB info validation failed: {{ precheck_shared_hdb_info_error }}
+      {%- else -%}
+      SID {{ item.sid }} expects instance {{ item.instance_name }} (HDB{{ item.instance_nr }}) on {{ inventory_hostname }}, but HDB info reported only {{ (precheck_shared_hdb_actual_instances | default([]) | join(', ')) if (precheck_shared_hdb_actual_instances | default([]) | length) > 0 else 'no running instances' }}.
+      {%- endif -%}
+  when: _shared_hdb_instance_id not in (precheck_shared_hdb_actual_instances | default([]))
+
+- name: "Collect shared HANA version data per instance"
+  include_tasks: tasks/precheck_shared_hana_instance.yml
+  loop: "{{ hana_instances | default([]) }}"
+  loop_control:
+    loop_var: shared_hana_instance
+    label: "{{ shared_hana_instance.instance_name }}"
+  when: do_hana | default(false) | bool
+
+- name: "Validate shared HANA SID contexts"
+  include_tasks: tasks/precheck_shared_hana_sid.yml
+  loop: "{{ precheck_shared_sid_contexts }}"
+  loop_control:
+    loop_var: shared_hana_sid_ctx
+    label: "{{ shared_hana_sid_ctx.sid }}"

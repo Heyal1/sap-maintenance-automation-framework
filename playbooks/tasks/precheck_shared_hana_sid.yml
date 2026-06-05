@@ -1,0 +1,350 @@
+---
+# =============================================================================
+# Shared Task: precheck_shared_hana_sid.yml
+# =============================================================================
+# Validates per-SID shared-host credentials and health gates, then persists the
+# per-SID PreCheck state.
+# =============================================================================
+
+- name: "Resolve shared HANA instance result for SID {{ shared_hana_sid_ctx.sid }}"
+  set_fact:
+    _shared_sid_instance_result: >-
+      {{
+        (
+          precheck_shared_instance_results
+          | default([])
+          | selectattr('instance_name', 'equalto', shared_hana_sid_ctx.instance_name)
+          | selectattr('instance_nr', 'equalto', shared_hana_sid_ctx.instance_nr)
+          | list
+          | first
+        ) | default({})
+      }}
+
+- name: "Initialize shared HANA SID pre-check facts"
+  set_fact:
+    _shared_sid_system_password: ""
+    _shared_sid_credential_ok: false
+    _shared_sid_credential_source: "{{ 'secret store SYSTEM credential' if (do_hana | default(false) | bool) else 'SKIPPED' }}"
+    _shared_sid_credential_failure_reason: "{{ 'Credential lookup not attempted.' if (do_hana | default(false) | bool) else 'Credential validation not required.' }}"
+
+- name: "Resolve shared HANA SYSTEM credential for SID {{ shared_hana_sid_ctx.sid }}"
+  set_fact:
+    _shared_sid_system_password: >-
+      {{
+        lookup('env', (shared_hana_sid_ctx.customer | upper) ~ '-HANA-' ~ (shared_hana_sid_ctx.sid | upper) ~ '-SYSTEM')
+        | default(lookup('env', (shared_hana_sid_ctx.customer | upper) ~ '_HANA_' ~ (shared_hana_sid_ctx.sid | upper) ~ '_SYSTEM'), true)
+        | default('', true)
+      }}
+    _shared_sid_credential_source: >-
+      {%- set exact = (shared_hana_sid_ctx.customer | upper) ~ '-HANA-' ~ (shared_hana_sid_ctx.sid | upper) ~ '-SYSTEM' -%}
+      {%- set alt = (shared_hana_sid_ctx.customer | upper) ~ '_HANA_' ~ (shared_hana_sid_ctx.sid | upper) ~ '_SYSTEM' -%}
+      {%- if (lookup('env', exact) | default('', true) | length) > 0 -%}
+      secret store SYSTEM credential ({{ exact }})
+      {%- elif (lookup('env', alt) | default('', true) | length) > 0 -%}
+      secret store SYSTEM credential ({{ alt }})
+      {%- else -%}
+      secret store SYSTEM credential
+      {%- endif -%}
+    _shared_sid_credential_failure_reason: "Credential lookup did not resolve a secret value."
+  when: do_hana | default(false) | bool
+
+- name: "Record missing shared HANA SYSTEM credential for SID {{ shared_hana_sid_ctx.sid }}"
+  set_fact:
+    precheck_hana_prereq_issues: >-
+      {{
+        precheck_hana_prereq_issues
+        + [
+          {
+            'component': 'HANA credential validation',
+            'reason': 'SID ' ~ shared_hana_sid_ctx.sid ~ ' is missing a resolved SYSTEM credential from ' ~ _shared_sid_credential_source ~ '.',
+            'sid': shared_hana_sid_ctx.sid,
+            'instance_name': shared_hana_sid_ctx.instance_name,
+            'instance_nr': shared_hana_sid_ctx.instance_nr
+          }
+        ]
+      }}
+  when:
+    - do_hana | default(false) | bool
+    - (_shared_sid_system_password | default('') | length) == 0
+
+- name: "Validate shared HANA SYSTEM credential for SID {{ shared_hana_sid_ctx.sid }}"
+  block:
+    - name: "Create temporary shared PreCheck key for SID {{ shared_hana_sid_ctx.sid }}"
+      sap.sap_operations.hdbuserstore:
+        key: "_PRECHECK_{{ shared_hana_sid_ctx.sid }}_SYS"
+        env: "localhost:3{{ shared_hana_sid_ctx.instance_nr }}13"
+        username: SYSTEM
+        password: "{{ _shared_sid_system_password }}"
+        force: true
+      become_user: "{{ shared_hana_sid_ctx.instance_name | lower }}adm"
+      become_flags: -i
+      no_log: true
+      vars:
+        ansible_python_interpreter: "/usr/libexec/platform-python -E"
+
+    - name: "Verify shared HANA SYSTEM credential for SID {{ shared_hana_sid_ctx.sid }}"
+      shell: |
+        export PATH="/usr/sap/{{ shared_hana_sid_ctx.instance_name }}/HDB{{ shared_hana_sid_ctx.instance_nr }}/exe:$PATH"
+        hdbsql -U _PRECHECK_{{ shared_hana_sid_ctx.sid }}_SYS -d {{ shared_hana_sid_ctx.sid }} -jaxC "SELECT 'OK' FROM DUMMY" 2>&1
+      become_user: "{{ shared_hana_sid_ctx.instance_name | lower }}adm"
+      become_flags: -i
+      register: precheck_shared_sid_system_check
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: "Set shared HANA credential validation result for SID {{ shared_hana_sid_ctx.sid }}"
+      set_fact:
+        _shared_sid_credential_ok: "{{ 'OK' in (precheck_shared_sid_system_check.stdout | default('')) }}"
+        _shared_sid_credential_failure_reason: >-
+          {{
+            'Connection succeeded.'
+            if ('OK' in (precheck_shared_sid_system_check.stdout | default('')))
+            else ((precheck_shared_sid_system_check.stderr | default(precheck_shared_sid_system_check.stdout | default('SYSTEM credential validation returned no output'))) | trim)
+          }}
+  rescue:
+    - name: "Capture shared HANA credential validation failure for SID {{ shared_hana_sid_ctx.sid }}"
+      set_fact:
+        _shared_sid_credential_ok: false
+        _shared_sid_credential_failure_reason: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('SYSTEM credential validation failed'))) }}"
+  always:
+    - name: "Remove temporary shared PreCheck key for SID {{ shared_hana_sid_ctx.sid }}"
+      sap.sap_operations.hdbuserstore:
+        key: "_PRECHECK_{{ shared_hana_sid_ctx.sid }}_SYS"
+        state: absent
+      become_user: "{{ shared_hana_sid_ctx.instance_name | lower }}adm"
+      become_flags: -i
+      vars:
+        ansible_python_interpreter: "/usr/libexec/platform-python -E"
+      ignore_errors: true
+  when:
+    - do_hana | default(false) | bool
+    - (_shared_sid_system_password | default('') | length) > 0
+
+- name: "Record failed shared HANA credential validation for SID {{ shared_hana_sid_ctx.sid }}"
+  set_fact:
+    precheck_hana_prereq_issues: >-
+      {{
+        precheck_hana_prereq_issues
+        + [
+          {
+            'component': 'HANA credential validation',
+            'reason': 'SID ' ~ shared_hana_sid_ctx.sid ~ ' using ' ~ _shared_sid_credential_source ~ ' failed. ' ~ _shared_sid_credential_failure_reason,
+            'sid': shared_hana_sid_ctx.sid,
+            'instance_name': shared_hana_sid_ctx.instance_name,
+            'instance_nr': shared_hana_sid_ctx.instance_nr
+          }
+        ]
+      }}
+  when:
+    - do_hana | default(false) | bool
+    - (_shared_sid_system_password | default('') | length) > 0
+    - not (_shared_sid_credential_ok | default(false) | bool)
+
+- name: "Build shared HANA Icinga targets for SID {{ shared_hana_sid_ctx.sid }}"
+  set_fact:
+    _shared_sid_icinga_targets: >-
+      {{
+        (shared_hana_sid_ctx.app_hosts | default([]))
+        if ((shared_hana_sid_ctx.app_hosts | default([]) | length) > 0)
+        else [inventory_hostname]
+      }}
+
+- name: "Query Icinga services for shared SID {{ shared_hana_sid_ctx.sid }}"
+  uri:
+    url: "{{ icinga_api_url }}/v1/objects/services"
+    method: POST
+    headers:
+      Accept: application/json
+      X-HTTP-Method-Override: GET
+    body_format: json
+    body:
+      filter: "host.name==\"{{ item }}\" || host.address==\"{{ hostvars[item].ansible_host | default(item) }}\""
+      attrs: ["last_check_result", "display_name"]
+    user: "{{ icinga_api_user }}"
+    password: "{{ icinga_api_pass }}"
+    force_basic_auth: true
+    validate_certs: false
+    timeout: 30
+    status_code: [200, 404]
+  loop: "{{ _shared_sid_icinga_targets }}"
+  loop_control:
+    label: "{{ item }}"
+  register: _shared_sid_icinga_queries
+  delegate_to: localhost
+  when: not (skip_icinga | default(false) | bool)
+
+- name: "Initialize filtered Icinga service state list for shared SID {{ shared_hana_sid_ctx.sid }}"
+  set_fact:
+    _shared_sid_filtered_services: []
+
+- name: "Build filtered Icinga service state list for shared SID {{ shared_hana_sid_ctx.sid }}"
+  set_fact:
+    _shared_sid_filtered_services: >-
+      {%- set ns = namespace(result=[]) -%}
+      {%- set exact = current_exclude_services | default([]) -%}
+      {%- set prefixes = icinga_exclude_service_prefixes | default([]) -%}
+      {%- for query in _shared_sid_icinga_queries.results | default([]) -%}
+        {%- for svc in query.json.results | default([]) if (query.status | default(0)) == 200 -%}
+          {%- set display = svc.attrs.display_name | default('') -%}
+          {%- set has_state = svc.attrs.last_check_result is defined -%}
+          {%- set state = svc.attrs.last_check_result.state if has_state else -1 -%}
+          {%- set skip = namespace(val=(display in exact)) -%}
+          {%- if not skip.val -%}
+            {%- for prefix in prefixes -%}
+              {%- if display is match(prefix) -%}
+                {%- set skip.val = true -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {%- if has_state and not skip.val -%}
+            {%- set ns.result = ns.result + [ {'target': query.item, 'display_name': display, 'state': state} ] -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ ns.result }}
+  when: not (skip_icinga | default(false) | bool)
+
+- name: "Build shared HANA health gate result for SID {{ shared_hana_sid_ctx.sid }}"
+  set_fact:
+    _shared_sid_health_gate_result:
+      host: "{{ inventory_hostname }}"
+      sid: "{{ shared_hana_sid_ctx.sid }}"
+      customer: "{{ shared_hana_sid_ctx.customer }}"
+      instance_name: "{{ shared_hana_sid_ctx.instance_name }}"
+      instance_nr: "{{ shared_hana_sid_ctx.instance_nr }}"
+      outcome: >-
+        {%- if skip_icinga | default(false) | bool -%}
+        BYPASSED
+        {%- elif (_shared_sid_filtered_services | selectattr('state', 'in', [2, 3]) | list | length) > 0 -%}
+        BLOCK
+        {%- else -%}
+        PASS
+        {%- endif -%}
+      skipped: "{{ skip_icinga | default(false) | bool }}"
+      targets: "{{ _shared_sid_icinga_targets }}"
+      excluded_services: "{{ current_exclude_services | default([]) }}"
+      ok_services: "{{ _shared_sid_filtered_services | selectattr('state', 'equalto', 0) | map(attribute='display_name') | list }}"
+      warning_services: "{{ _shared_sid_filtered_services | selectattr('state', 'equalto', 1) | map(attribute='display_name') | list }}"
+      critical_services: "{{ _shared_sid_filtered_services | selectattr('state', 'in', [2, 3]) | map(attribute='display_name') | list }}"
+
+- name: "Record shared HANA Icinga gate failures for SID {{ shared_hana_sid_ctx.sid }}"
+  set_fact:
+    precheck_shared_icinga_gate_failures: >-
+      {{
+        precheck_shared_icinga_gate_failures
+        + [
+          {
+            'sid': shared_hana_sid_ctx.sid,
+            'targets': _shared_sid_health_gate_result.targets,
+            'critical_services': _shared_sid_health_gate_result.critical_services
+          }
+        ]
+      }}
+  when:
+    - not (skip_icinga | default(false) | bool)
+    - (_shared_sid_health_gate_result.critical_services | default([]) | length) > 0
+
+- name: "Ensure shared SID state directory exists for {{ shared_hana_sid_ctx.sid }}"
+  include_tasks: tasks/create_state_directory.yml
+  vars:
+    target_state_sid: "{{ shared_hana_sid_ctx.sid }}"
+
+- name: "Build shared SID issue subsets"
+  set_fact:
+    _shared_sid_version_issues: >-
+      {{
+        precheck_version_validation_issues
+        | default([])
+        | selectattr('sid', 'defined')
+        | selectattr('sid', 'equalto', shared_hana_sid_ctx.sid)
+        | list
+      }}
+    _shared_sid_prereq_issues: >-
+      {{
+        precheck_hana_prereq_issues
+        | default([])
+        | selectattr('sid', 'defined')
+        | selectattr('sid', 'equalto', shared_hana_sid_ctx.sid)
+        | list
+      }}
+
+- name: "Build shared SID version snapshot"
+  set_fact:
+    _shared_sid_version_snapshot:
+      host: "{{ inventory_hostname }}"
+      sid: "{{ shared_hana_sid_ctx.sid }}"
+      customer: "{{ shared_hana_sid_ctx.customer }}"
+      instance_name: "{{ shared_hana_sid_ctx.instance_name }}"
+      instance_nr: "{{ shared_hana_sid_ctx.instance_nr }}"
+      run_id: "{{ pipeline_run_id | default('local') | string }}"
+      shared_host: true
+      kernel:
+        patch_version: SKIPPED
+        key_executables: {}
+        inventory_state_file: ""
+      hana:
+        version: "{{ (_shared_sid_instance_result.version | default(precheck_undetermined_version_message)) if (do_hana | default(false) | bool) else 'SKIPPED' }}"
+        components: "{{ (_shared_sid_instance_result.components | default([])) if (do_hana | default(false) | bool) else [] }}"
+        component_discovery_path: "{{ (_shared_sid_instance_result.component_discovery_path | default('')) if (do_hana | default(false) | bool) else '' }}"
+        component_output: "{{ (_shared_sid_instance_result.component_output | default('')) if (do_hana | default(false) | bool) else '' }}"
+        credential_validation:
+          ok: "{{ _shared_sid_credential_ok | default(false) | bool if (do_hana | default(false) | bool) else false }}"
+          source: "{{ _shared_sid_credential_source if (do_hana | default(false) | bool) else 'SKIPPED' }}"
+          failure_reason: "{{ _shared_sid_credential_failure_reason if (do_hana | default(false) | bool) else 'SKIPPED' }}"
+      version_validation:
+        outcome: "{{ 'PASS' if (_shared_sid_version_issues | default([]) | length) == 0 else 'FAIL' }}"
+        issues: "{{ _shared_sid_version_issues | default([]) }}"
+      hana_prerequisites:
+        outcome: "{{ 'PASS' if (_shared_sid_prereq_issues | default([]) | length) == 0 else 'FAIL' }}"
+        issues: "{{ _shared_sid_prereq_issues | default([]) }}"
+
+- name: "Persist shared SID version snapshot"
+  copy:
+    content: "{{ _shared_sid_version_snapshot | to_nice_yaml }}"
+    dest: "{{ _state_dir }}/precheck_versions.yml"
+  delegate_to: localhost
+  become: false
+
+- name: "Persist shared SID HANA version baseline"
+  copy:
+    content: "{{ _shared_sid_version_snapshot.hana.version }}\n"
+    dest: "{{ _state_dir }}/hana_ver_before_{{ inventory_hostname }}.txt"
+  delegate_to: localhost
+  become: false
+  when: do_hana | default(false) | bool
+
+- name: "Build shared SID disk validation state"
+  set_fact:
+    _shared_sid_disk_validation_state:
+      host: "{{ inventory_hostname }}"
+      sid: "{{ shared_hana_sid_ctx.sid }}"
+      customer: "{{ shared_hana_sid_ctx.customer }}"
+      instance_name: "{{ shared_hana_sid_ctx.instance_name }}"
+      instance_nr: "{{ shared_hana_sid_ctx.instance_nr }}"
+      shared_host: true
+      shared_filesystem: true
+      outcome: >-
+        {%- if (precheck_disk_validation_issues | default([]) | length) > 0 -%}
+        BLOCK
+        {%- elif (preflight_disk_results | default([]) | length) > 0 -%}
+        PASS
+        {%- else -%}
+        SKIPPED
+        {%- endif -%}
+      results: "{{ preflight_disk_results | default([]) }}"
+      issues: "{{ precheck_disk_validation_issues | default([]) }}"
+
+- name: "Persist shared SID disk validation state"
+  copy:
+    content: "{{ _shared_sid_disk_validation_state | to_nice_yaml }}"
+    dest: "{{ _state_dir }}/disk_space_results.yml"
+  delegate_to: localhost
+  become: false
+
+- name: "Persist shared SID health gate state"
+  copy:
+    content: "{{ _shared_sid_health_gate_result | to_nice_yaml }}"
+    dest: "{{ _state_dir }}/health_gate_results.yml"
+  delegate_to: localhost
+  become: false

@@ -1,0 +1,959 @@
+# ============================================================================
+# Azure DevOps Pipeline: Maintenance - SAP Patch run
+# ============================================================================
+# Stages:
+#   PreCheck         - Version capture, Icinga status check
+#   IcingaDowntime   - Set global host downtime
+#   StopApplications - Stop SAP + HANA systems
+#   KernelUpdate     - SAP kernel update with rollback (conditional)
+#   HanaUpdate       - HANA backup + update (conditional)
+#   HanaMiniChecks   - Manual HANA Studio checks (conditional)
+#   OsPatch          - OS patching with reboot (conditional)
+#   StartApplications - Consolidated SAP restart (conditional)
+#   Validation       - Health check, remove downtime, send report
+#   FailureNotify    - Automatic failure email (on failure only)
+#
+# Each stage calls a dedicated playbook.
+#
+# Dependency Chain (sequential):
+#   PreCheck → IcingaDowntime → StopApplications → KernelUpdate → HanaUpdate
+#   → HanaMiniChecks → OsPatch → StartApplications → ValidationNotify
+#   → FailureNotify
+#
+# On stage failure all subsequent stages are skipped.
+# Individual update stages (OS/HANA/Kernel) are controlled via boolean
+# parameters, NOT via 'Stages to run'.
+# ============================================================================
+trigger: none
+pr: none
+
+pool:
+  name: 'SAP Maintenance Runner'
+
+parameters:
+  # --- TARGET SELECTION ---
+  - name: customer
+    displayName: 'Customer'
+    type: string
+    default: 'DEMO'
+    values:
+      - 'DEMO'
+      - 'SHARED_HANA'
+      - 'TENANT_A'
+      - 'TENANT_B'
+      - 'TENANT_C'
+
+  - name: environment
+    displayName: 'Environment'
+    type: string
+    default: 'DEV'
+    values:
+      - 'DEV'
+      - 'QAS'
+      - 'PRD'
+      - 'SHARED_HANA_demohdb01'
+
+  # --- UPDATE TYPE CHECKBOXES ---
+  - name: do_kernel_update
+    displayName: 'SAP Kernel Update'
+    type: boolean
+    default: true
+
+  - name: do_os_update
+    displayName: 'OS Patching (includes reboot)'
+    type: boolean
+    default: false
+
+  - name: do_hana_update
+    displayName: 'HANA Database Update'
+    type: boolean
+    default: false
+
+  - name: skip_icinga
+    displayName: 'Skip Icinga API calls (use when Icinga credentials are unavailable)'
+    type: boolean
+    default: false
+
+  - name: do_root_keys
+    displayName: 'Rotate HANA encryption root keys'
+    type: boolean
+    default: false
+
+  # --- OPTIONAL SETTINGS ---
+  - name: email_recipient
+    displayName: 'Email Report Recipient (none = no email)'
+    type: string
+    default: 'none'
+
+  - name: downtime_duration_minutes
+    displayName: 'Icinga Downtime Duration (minutes, default 60)'
+    type: number
+    default: 60
+
+  - name: exclude_icinga_services_sap
+    displayName: 'Exclude Icinga SAP services (e.g. uptime,sap_memory,sap_backup)'
+    type: string
+    default: 'uptime'
+
+  - name: exclude_icinga_services_hana
+    displayName: 'Exclude Icinga HANA services (e.g. uptime,hana_backup,hana_memory)'
+    type: string
+    default: 'uptime'
+
+# Auto-detected at runtime:
+#   - dedicated HANA credentials: from inventory (customer + sap_sid)
+#   - hana_minichecks: always enabled for HANA updates
+
+variables:
+  - group: SAP-Maintenance-Demo-Secrets
+  - name: ANSIBLE_FORCE_COLOR
+    value: 'true'
+  - name: PIPELINE_REQUESTED_BY
+    value: $(Build.RequestedFor)
+  - name: PIPELINE_RUN_ID
+    value: $(Build.BuildId)
+  - name: PROJECT_ROOT
+    value: '$(Build.SourcesDirectory)'
+
+stages:
+  # --------------------------------------------------------------------------
+  # STAGE 1: PRE-CHECK
+  # --------------------------------------------------------------------------
+  - stage: PreCheck
+    displayName: 'Pre-Check'
+    jobs:
+      - job: Check
+        steps:
+          - bash: sudo rm -rf "$(Build.SourcesDirectory)/reports" 2>/dev/null || true
+            displayName: 'Cleanup previous report files'
+
+          - checkout: self
+            clean: true
+
+          - bash: |
+              set -euo pipefail
+
+              fail() {
+                echo "##vso[task.logissue type=error]$1"
+                exit 1
+              }
+
+              assert_boolean() {
+                local name="$1"
+                local value="${2,,}"  # lowercase for comparison
+
+                if [[ "$value" != "true" && "$value" != "false" ]]; then
+                  fail "Invalid ${name}: expected true or false, received '${2}'."
+                fi
+              }
+
+              assert_regex() {
+                local name="$1"
+                local value="$2"
+                local regex="$3"
+                local requirement="$4"
+
+                if [[ ! "$value" =~ $regex ]]; then
+                  fail "Invalid ${name}: ${requirement}. Received '${value}'."
+                fi
+              }
+
+              assert_length() {
+                local name="$1"
+                local value="$2"
+                local min_length="$3"
+                local max_length="$4"
+
+                if (( ${#value} < min_length || ${#value} > max_length )); then
+                  fail "Invalid ${name}: expected length ${min_length}-${max_length}, received ${#value}."
+                fi
+              }
+
+              validate_service_list() {
+                local name="$1"
+                local value="$2"
+
+                if [[ -z "$value" ]]; then
+                  return 0
+                fi
+
+                assert_regex "$name" "$value" '^[A-Za-z0-9_.:-]+([[:space:]]*,[[:space:]]*[A-Za-z0-9_.:-]+)*$' 'must be a comma-separated list of service identifiers using letters, digits, dot, underscore, colon, or hyphen'
+              }
+
+              assert_length "customer" "$PARAM_CUSTOMER" 3 20
+              assert_regex "customer" "$PARAM_CUSTOMER" '^[A-Z0-9_]+$' 'must contain only uppercase letters, digits, or underscores'
+
+              assert_length "environment" "$PARAM_ENVIRONMENT" 2 40
+              assert_regex "environment" "$PARAM_ENVIRONMENT" '^[A-Za-z0-9_]+$' 'must contain only letters, digits, or underscores'
+
+              if [[ "$PARAM_CUSTOMER" == "SHARED_HANA" ]]; then
+                assert_regex "environment" "$PARAM_ENVIRONMENT" '^SHARED_HANA_[a-z0-9]+$' 'shared HANA runs must target SHARED_HANA_<host>'
+              elif [[ "$PARAM_ENVIRONMENT" == SHARED_HANA_* ]]; then
+                fail "Invalid environment: shared-host environment values require customer SHARED_HANA."
+              fi
+
+              assert_boolean "do_kernel_update" "$PARAM_DO_KERNEL_UPDATE"
+              assert_boolean "do_os_update" "$PARAM_DO_OS_UPDATE"
+              assert_boolean "do_hana_update" "$PARAM_DO_HANA_UPDATE"
+              assert_boolean "skip_icinga" "$PARAM_SKIP_ICINGA"
+              assert_boolean "do_root_keys" "$PARAM_DO_ROOT_KEYS"
+
+              if [[ "$PARAM_EMAIL_RECIPIENT" != "none" ]]; then
+                assert_length "email_recipient" "$PARAM_EMAIL_RECIPIENT" 6 254
+                assert_regex "email_recipient" "$PARAM_EMAIL_RECIPIENT" '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' 'must be none or a valid email address'
+              fi
+
+              if [[ ! "$PARAM_DOWNTIME_DURATION_MINUTES" =~ ^[0-9]+$ ]]; then
+                fail "Invalid downtime_duration_minutes: expected a positive integer, received '${PARAM_DOWNTIME_DURATION_MINUTES}'."
+              fi
+
+              if (( PARAM_DOWNTIME_DURATION_MINUTES < 1 || PARAM_DOWNTIME_DURATION_MINUTES > 1440 )); then
+                fail "Invalid downtime_duration_minutes: expected a value between 1 and 1440 minutes, received '${PARAM_DOWNTIME_DURATION_MINUTES}'."
+              fi
+
+              validate_service_list "exclude_icinga_services_sap" "$PARAM_EXCLUDE_ICINGA_SERVICES_SAP"
+              validate_service_list "exclude_icinga_services_hana" "$PARAM_EXCLUDE_ICINGA_SERVICES_HANA"
+            displayName: 'Validate Pipeline Parameters'
+            env:
+              PARAM_CUSTOMER: '${{ parameters.customer }}'
+              PARAM_ENVIRONMENT: '${{ parameters.environment }}'
+              PARAM_DO_KERNEL_UPDATE: '${{ parameters.do_kernel_update }}'
+              PARAM_DO_OS_UPDATE: '${{ parameters.do_os_update }}'
+              PARAM_DO_HANA_UPDATE: '${{ parameters.do_hana_update }}'
+              PARAM_SKIP_ICINGA: '${{ parameters.skip_icinga }}'
+              PARAM_DO_ROOT_KEYS: '${{ parameters.do_root_keys }}'
+              PARAM_EMAIL_RECIPIENT: '${{ parameters.email_recipient }}'
+              PARAM_DOWNTIME_DURATION_MINUTES: '${{ parameters.downtime_duration_minutes }}'
+              PARAM_EXCLUDE_ICINGA_SERVICES_SAP: '${{ parameters.exclude_icinga_services_sap }}'
+              PARAM_EXCLUDE_ICINGA_SERVICES_HANA: '${{ parameters.exclude_icinga_services_hana }}'
+
+          - bash: |
+              # Direct checkbox parameters - no scenario parsing needed
+              echo "##vso[task.setvariable variable=DO_KERNEL]${{ parameters.do_kernel_update }}"
+              echo "##vso[task.setvariable variable=DO_OS]${{ parameters.do_os_update }}"
+              echo "##vso[task.setvariable variable=DO_HANA]${{ parameters.do_hana_update }}"
+            displayName: "Set Update Flags from Checkboxes"
+
+          # Run PreCheck playbook: capture BEFORE versions, Icinga health gate
+          # LIMIT restricts Ansible to the selected inventory target.
+          - bash: |
+              if [ "${{ parameters.customer }}" = "SHARED_HANA" ]; then
+                LIMIT="${{ parameters.environment }}"
+              else
+                LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+              fi
+
+              ansible-playbook playbooks/03_maintenance_precheck.yml \
+                -i inventory/inventory.yml \
+                -l "$LIMIT" \
+                -e @vars/common.yml \
+                -e do_kernel=$DO_KERNEL \
+                -e do_os_patch=$DO_OS \
+                -e do_hana=$DO_HANA \
+                -e do_root_keys=${{ parameters.do_root_keys }} \
+                -e staging_customer=${{ parameters.customer }} \
+                -e staging_environment=${{ parameters.environment }} \
+                -e pipeline_requested_by="$PIPELINE_REQUESTED_BY" \
+                -e pipeline_run_id="$PIPELINE_RUN_ID" \
+                -e email_recipient="${{ parameters.email_recipient }}" \
+                -e downtime_duration_minutes=${{ parameters.downtime_duration_minutes }} \
+                -e "exclude_icinga_services_sap=${{ parameters.exclude_icinga_services_sap }}" \
+                -e "exclude_icinga_services_hana=${{ parameters.exclude_icinga_services_hana }}" \
+                -e skip_icinga=${{ parameters.skip_icinga }} \
+                -v
+            displayName: 'Pre-Check + Version Capture'
+            workingDirectory: $(PROJECT_ROOT)
+            env:
+              ICINGA_URL: $(ICINGA-URL)
+              ICINGA_USER: $(ICINGA-USER)
+              ICINGA_PASS: $(ICINGA-PASS)
+              AZURE_DEVOPS_PIPELINE_URL_BASE: $(AZURE-DEVOPS-PIPELINE-URL-BASE)
+              HANA_ADMIN_USER: $(HANA-ADMIN-USER)
+              # Demo HANA credentials. Secret pattern: <CUSTOMER>-HANA-<SID>-<ROLE>.
+              DEMO_HANA_D01_HANA_ADMIN: $(DEMO-HANA-D01-HANA-ADMIN)
+              DEMO_HANA_D01_SYSTEM: $(DEMO-HANA-D01-SYSTEM)
+              DEMO_HANA_D01_SIDADM: $(DEMO-HANA-D01-SIDADM)
+              DEMO_HANA_D01_SAPADM: $(DEMO-HANA-D01-SAPADM)
+              DEMO_HANA_D01_ROOT: $(DEMO-HANA-D01-ROOT)
+              TENANT_A_HANA_A1D_HANA_ADMIN: $(TENANT-A-HANA-A1D-HANA-ADMIN)
+              TENANT_A_HANA_A1D_SYSTEM: $(TENANT-A-HANA-A1D-SYSTEM)
+              TENANT_A_HANA_A1D_SIDADM: $(TENANT-A-HANA-A1D-SIDADM)
+              TENANT_A_HANA_A1D_SAPADM: $(TENANT-A-HANA-A1D-SAPADM)
+              TENANT_A_HANA_A1D_ROOT: $(TENANT-A-HANA-A1D-ROOT)
+              TENANT_B_HANA_B1Q_HANA_ADMIN: $(TENANT-B-HANA-B1Q-HANA-ADMIN)
+              TENANT_B_HANA_B1Q_SYSTEM: $(TENANT-B-HANA-B1Q-SYSTEM)
+              TENANT_B_HANA_B1Q_SIDADM: $(TENANT-B-HANA-B1Q-SIDADM)
+              TENANT_B_HANA_B1Q_SAPADM: $(TENANT-B-HANA-B1Q-SAPADM)
+              TENANT_B_HANA_B1Q_ROOT: $(TENANT-B-HANA-B1Q-ROOT)
+              TENANT_C_HANA_C1P_HANA_ADMIN: $(TENANT-C-HANA-C1P-HANA-ADMIN)
+              TENANT_C_HANA_C1P_SYSTEM: $(TENANT-C-HANA-C1P-SYSTEM)
+              TENANT_C_HANA_C1P_SIDADM: $(TENANT-C-HANA-C1P-SIDADM)
+              TENANT_C_HANA_C1P_SAPADM: $(TENANT-C-HANA-C1P-SAPADM)
+              TENANT_C_HANA_C1P_ROOT: $(TENANT-C-HANA-C1P-ROOT)
+
+  # --------------------------------------------------------------------------
+  # STAGE: ICINGA DOWNTIME
+  # --------------------------------------------------------------------------
+  - stage: IcingaDowntime
+    displayName: 'Icinga Downtime'
+    dependsOn: PreCheck
+    # Skipped only when no maintenance action is selected.
+    # When skip_icinga=true, this stage still runs to record the bypass in the
+    # run audit trail and maintenance report state.
+    condition: >-
+      and(
+        in(dependencies.PreCheck.result, 'Succeeded', 'SucceededWithIssues'),
+        or(
+          eq('${{ parameters.do_kernel_update }}', 'true'),
+          eq('${{ parameters.do_os_update }}', 'true'),
+          eq('${{ parameters.do_hana_update }}', 'true')
+        )
+      )
+    jobs:
+      - job: SetDowntime
+        steps:
+          - bash: sudo rm -rf "$(Build.SourcesDirectory)/reports" 2>/dev/null || true
+            displayName: 'Cleanup previous report files'
+
+          - checkout: self
+            clean: true
+
+          - bash: |
+              echo "##vso[task.setvariable variable=DO_KERNEL]${{ parameters.do_kernel_update }}"
+              echo "##vso[task.setvariable variable=DO_OS]${{ parameters.do_os_update }}"
+              echo "##vso[task.setvariable variable=DO_HANA]${{ parameters.do_hana_update }}"
+            displayName: "Set Update Flags"
+
+          # Set Icinga downtime once at maintenance start or record an
+          # explicit skip_icinga bypass in the downtime audit state.
+          - bash: |
+              if [ "${{ parameters.customer }}" = "SHARED_HANA" ]; then
+                LIMIT="${{ parameters.environment }}"
+              else
+                LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+              fi
+
+              ansible-playbook playbooks/03_maintenance_downtime.yml \
+                -i inventory/inventory.yml \
+                -l "$LIMIT" \
+                -e @vars/common.yml \
+                -e do_kernel=$DO_KERNEL \
+                -e do_os_patch=$DO_OS \
+                -e do_hana=$DO_HANA \
+                -e do_root_keys=${{ parameters.do_root_keys }} \
+                -e staging_customer=${{ parameters.customer }} \
+                -e staging_environment=${{ parameters.environment }} \
+                -e pipeline_requested_by="$PIPELINE_REQUESTED_BY" \
+                -e pipeline_run_id="$PIPELINE_RUN_ID" \
+                -e email_recipient="${{ parameters.email_recipient }}" \
+                -e downtime_duration_minutes=${{ parameters.downtime_duration_minutes }} \
+                -e skip_icinga=${{ parameters.skip_icinga }} \
+                -v
+            displayName: 'Manage Icinga Downtime / Bypass'
+            workingDirectory: $(PROJECT_ROOT)
+            env:
+              ICINGA_URL: $(ICINGA-URL)
+              ICINGA_USER: $(ICINGA-USER)
+              ICINGA_PASS: $(ICINGA-PASS)
+              AZURE_DEVOPS_PIPELINE_URL_BASE: $(AZURE-DEVOPS-PIPELINE-URL-BASE)
+
+  # --------------------------------------------------------------------------
+  # STAGE: STOP APPLICATIONS
+  # --------------------------------------------------------------------------
+  - stage: StopApplications
+    displayName: 'Stop Applications'
+    dependsOn:
+      - PreCheck
+      - IcingaDowntime
+    # Tolerates skipped IcingaDowntime and skips fully for PreCheck-only runs.
+    condition: >-
+      and(
+        in(dependencies.PreCheck.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.IcingaDowntime.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        or(
+          eq('${{ parameters.do_kernel_update }}', 'true'),
+          eq('${{ parameters.do_os_update }}', 'true'),
+          eq('${{ parameters.do_hana_update }}', 'true')
+        )
+      )
+    jobs:
+      - job: Stop
+        steps:
+          - bash: sudo rm -rf "$(Build.SourcesDirectory)/reports" 2>/dev/null || true
+            displayName: 'Cleanup previous report files'
+
+          - checkout: self
+            clean: true
+
+          - bash: |
+              echo "##vso[task.setvariable variable=DO_KERNEL]${{ parameters.do_kernel_update }}"
+              echo "##vso[task.setvariable variable=DO_OS]${{ parameters.do_os_update }}"
+              echo "##vso[task.setvariable variable=DO_HANA]${{ parameters.do_hana_update }}"
+            displayName: "Set Update Flags"
+
+          # Gracefully stop SAP application servers and HANA databases
+          - bash: |
+              if [ "${{ parameters.customer }}" = "SHARED_HANA" ]; then
+                LIMIT="${{ parameters.environment }}"
+              else
+                LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+              fi
+
+              ansible-playbook playbooks/03_maintenance_stop.yml \
+                -i inventory/inventory.yml \
+                -l "$LIMIT" \
+                -e @vars/common.yml \
+                -e do_kernel=$DO_KERNEL \
+                -e do_os_patch=$DO_OS \
+                -e do_hana=$DO_HANA \
+                -e do_root_keys=${{ parameters.do_root_keys }} \
+                -e staging_customer=${{ parameters.customer }} \
+                -e staging_environment=${{ parameters.environment }} \
+                -e pipeline_requested_by="$PIPELINE_REQUESTED_BY" \
+                -e pipeline_run_id="$PIPELINE_RUN_ID" \
+                -e email_recipient="${{ parameters.email_recipient }}" \
+                -v
+            displayName: 'Stop SAP + HANA Systems'
+            workingDirectory: $(PROJECT_ROOT)
+
+  # --------------------------------------------------------------------------
+  # STAGE 3a: KERNEL UPDATE
+  # --------------------------------------------------------------------------
+  - stage: KernelUpdate
+    displayName: 'Kernel Update'
+    dependsOn: StopApplications
+    condition: >-
+      and(
+        not(canceled()),
+        in(dependencies.StopApplications.result, 'Succeeded', 'SucceededWithIssues'),
+        eq('${{ parameters.do_kernel_update }}', 'true')
+      )
+    jobs:
+      - job: Kernel
+        steps:
+          - bash: sudo rm -rf "$(Build.SourcesDirectory)/reports" 2>/dev/null || true
+            displayName: 'Cleanup previous report files'
+
+          - checkout: self
+            clean: true
+
+          - bash: |
+              # Direct checkbox parameters - no scenario parsing needed
+              echo "##vso[task.setvariable variable=DO_KERNEL]${{ parameters.do_kernel_update }}"
+              echo "##vso[task.setvariable variable=DO_OS]${{ parameters.do_os_update }}"
+              echo "##vso[task.setvariable variable=DO_HANA]${{ parameters.do_hana_update }}"
+            displayName: "Set Update Flags from Checkboxes"
+
+          # SAP kernel update with automatic rollback on failure
+          - bash: |
+              if [ "${{ parameters.customer }}" = "SHARED_HANA" ]; then
+                LIMIT="${{ parameters.environment }}"
+              else
+                LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+              fi
+
+              ansible-playbook playbooks/03_maintenance_kernel.yml \
+                -i inventory/inventory.yml \
+                -l "$LIMIT" \
+                -e @vars/common.yml \
+                -e do_kernel=$DO_KERNEL \
+                -e do_os_patch=$DO_OS \
+                -e do_hana=$DO_HANA \
+                -e do_root_keys=${{ parameters.do_root_keys }} \
+                -e staging_customer=${{ parameters.customer }} \
+                -e staging_environment=${{ parameters.environment }} \
+                -e pipeline_requested_by="$PIPELINE_REQUESTED_BY" \
+                -e pipeline_run_id="$PIPELINE_RUN_ID" \
+                -e email_recipient="${{ parameters.email_recipient }}" \
+                -v
+            displayName: 'SAP Kernel Update with Rollback'
+            workingDirectory: $(PROJECT_ROOT)
+
+  # --------------------------------------------------------------------------
+  # STAGE 3b: HANA UPDATE
+  # --------------------------------------------------------------------------
+  - stage: HanaUpdate
+    displayName: 'HANA Update'
+    dependsOn:
+      - StopApplications
+      - KernelUpdate
+    condition: >-
+      and(
+        not(canceled()),
+        in(dependencies.StopApplications.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.KernelUpdate.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        eq('${{ parameters.do_hana_update }}', 'true')
+      )
+    jobs:
+      - job: HanaUpdate
+        steps:
+          - bash: sudo rm -rf "$(Build.SourcesDirectory)/reports" 2>/dev/null || true
+            displayName: 'Cleanup previous report files'
+
+          - checkout: self
+            clean: true
+
+          - bash: |
+              # Direct checkbox parameters - no scenario parsing needed
+              echo "##vso[task.setvariable variable=DO_KERNEL]${{ parameters.do_kernel_update }}"
+              echo "##vso[task.setvariable variable=DO_OS]${{ parameters.do_os_update }}"
+              echo "##vso[task.setvariable variable=DO_HANA]${{ parameters.do_hana_update }}"
+            displayName: "Set Update Flags from Checkboxes"
+
+          # HANA backup (SYSTEMDB + tenants), server update, encryption keys
+          - bash: |
+              if [ "${{ parameters.customer }}" = "SHARED_HANA" ]; then
+                LIMIT="${{ parameters.environment }}"
+              else
+                LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+              fi
+
+              ansible-playbook playbooks/03_maintenance_hana.yml \
+                -i inventory/inventory.yml \
+                -l "$LIMIT" \
+                -e @vars/common.yml \
+                -e do_kernel=$DO_KERNEL \
+                -e do_os_patch=$DO_OS \
+                -e do_hana=$DO_HANA \
+                -e do_root_keys=${{ parameters.do_root_keys }} \
+                -e staging_customer=${{ parameters.customer }} \
+                -e staging_environment=${{ parameters.environment }} \
+                -e pipeline_requested_by="$PIPELINE_REQUESTED_BY" \
+                -e pipeline_run_id="$PIPELINE_RUN_ID" \
+                -e email_recipient="${{ parameters.email_recipient }}" \
+                -v
+            displayName: 'HANA Backup + Update'
+            workingDirectory: $(PROJECT_ROOT)
+            env:
+              AZURE_DEVOPS_PIPELINE_URL_BASE: $(AZURE-DEVOPS-PIPELINE-URL-BASE)
+              HANA_ADMIN_USER: $(HANA-ADMIN-USER)
+              # Demo HANA credentials. Secret pattern: <CUSTOMER>-HANA-<SID>-<ROLE>.
+              DEMO_HANA_D01_HANA_ADMIN: $(DEMO-HANA-D01-HANA-ADMIN)
+              DEMO_HANA_D01_SYSTEM: $(DEMO-HANA-D01-SYSTEM)
+              DEMO_HANA_D01_SIDADM: $(DEMO-HANA-D01-SIDADM)
+              DEMO_HANA_D01_SAPADM: $(DEMO-HANA-D01-SAPADM)
+              DEMO_HANA_D01_ROOT: $(DEMO-HANA-D01-ROOT)
+              TENANT_A_HANA_A1D_HANA_ADMIN: $(TENANT-A-HANA-A1D-HANA-ADMIN)
+              TENANT_A_HANA_A1D_SYSTEM: $(TENANT-A-HANA-A1D-SYSTEM)
+              TENANT_A_HANA_A1D_SIDADM: $(TENANT-A-HANA-A1D-SIDADM)
+              TENANT_A_HANA_A1D_SAPADM: $(TENANT-A-HANA-A1D-SAPADM)
+              TENANT_A_HANA_A1D_ROOT: $(TENANT-A-HANA-A1D-ROOT)
+              TENANT_B_HANA_B1Q_HANA_ADMIN: $(TENANT-B-HANA-B1Q-HANA-ADMIN)
+              TENANT_B_HANA_B1Q_SYSTEM: $(TENANT-B-HANA-B1Q-SYSTEM)
+              TENANT_B_HANA_B1Q_SIDADM: $(TENANT-B-HANA-B1Q-SIDADM)
+              TENANT_B_HANA_B1Q_SAPADM: $(TENANT-B-HANA-B1Q-SAPADM)
+              TENANT_B_HANA_B1Q_ROOT: $(TENANT-B-HANA-B1Q-ROOT)
+              TENANT_C_HANA_C1P_HANA_ADMIN: $(TENANT-C-HANA-C1P-HANA-ADMIN)
+              TENANT_C_HANA_C1P_SYSTEM: $(TENANT-C-HANA-C1P-SYSTEM)
+              TENANT_C_HANA_C1P_SIDADM: $(TENANT-C-HANA-C1P-SIDADM)
+              TENANT_C_HANA_C1P_SAPADM: $(TENANT-C-HANA-C1P-SAPADM)
+              TENANT_C_HANA_C1P_ROOT: $(TENANT-C-HANA-C1P-ROOT)
+
+  # --------------------------------------------------------------------------
+  # STAGE 3c: HANA MINICHECKS (Manual Approval Gate)
+  # --------------------------------------------------------------------------
+  - stage: HanaMiniChecks
+    displayName: 'HANA MiniChecks'
+    dependsOn:
+      - StopApplications
+      - KernelUpdate
+      - HanaUpdate
+    condition: >-
+      and(
+        not(canceled()),
+        in(dependencies.StopApplications.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.KernelUpdate.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.HanaUpdate.result, 'Succeeded', 'SucceededWithIssues'),
+        eq('${{ parameters.do_hana_update }}', 'true')
+      )
+    jobs:
+      - job: ManualApproval
+        pool: server
+        timeoutInMinutes: 480
+        steps:
+          - task: ManualValidation@1
+            timeoutInMinutes: 480
+            inputs:
+              notifyUsers: '${{ parameters.email_recipient }}'
+              instructions: |
+                HANA Update completed. Please perform HANA Studio MiniChecks:
+
+                1. Open HANA Studio and connect to the system
+                2. Administration > Overview: Verify system status (all services green)
+                3. Administration > Alerts: No critical alerts
+                4. System Information > Services: All services ACTIVE
+                5. Volumes Tab: Persistence and log volumes OK
+                6. Performance > Threads: No blocked threads
+
+                After verification: Click "Resume" to continue, or "Reject" to abort.
+              onTimeout: 'reject'
+
+  # --------------------------------------------------------------------------
+  # STAGE 3d: OS PATCHING
+  # --------------------------------------------------------------------------
+  - stage: OsPatch
+    displayName: 'OS Update'
+    dependsOn:
+      - StopApplications
+      - KernelUpdate
+      - HanaUpdate
+      - HanaMiniChecks
+    condition: >-
+      and(
+        not(canceled()),
+        in(dependencies.StopApplications.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.KernelUpdate.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.HanaUpdate.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.HanaMiniChecks.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        eq('${{ parameters.do_os_update }}', 'true')
+      )
+    jobs:
+      - job: OsPatch
+        steps:
+          - bash: sudo rm -rf "$(Build.SourcesDirectory)/reports" 2>/dev/null || true
+            displayName: 'Cleanup previous report files'
+
+          - checkout: self
+            clean: true
+
+          - bash: |
+              # Direct checkbox parameters - no scenario parsing needed
+              echo "##vso[task.setvariable variable=DO_KERNEL]${{ parameters.do_kernel_update }}"
+              echo "##vso[task.setvariable variable=DO_OS]${{ parameters.do_os_update }}"
+              echo "##vso[task.setvariable variable=DO_HANA]${{ parameters.do_hana_update }}"
+            displayName: "Set Update Flags from Checkboxes"
+
+          # Apply OS patches (dnf update) and reboot if packages changed
+          - bash: |
+              if [ "${{ parameters.customer }}" = "SHARED_HANA" ]; then
+                LIMIT="${{ parameters.environment }}"
+              else
+                LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+              fi
+
+              ansible-playbook playbooks/03_maintenance_os.yml \
+                -i inventory/inventory.yml \
+                -l "$LIMIT" \
+                -e @vars/common.yml \
+                -e do_kernel=$DO_KERNEL \
+                -e do_os_patch=$DO_OS \
+                -e do_hana=$DO_HANA \
+                -e do_root_keys=${{ parameters.do_root_keys }} \
+                -e staging_customer=${{ parameters.customer }} \
+                -e staging_environment=${{ parameters.environment }} \
+                -e pipeline_requested_by="$PIPELINE_REQUESTED_BY" \
+                -e pipeline_run_id="$PIPELINE_RUN_ID" \
+                -e email_recipient="${{ parameters.email_recipient }}" \
+                -v
+            displayName: 'OS Patching with Reboot'
+            workingDirectory: $(PROJECT_ROOT)
+
+  # --------------------------------------------------------------------------
+  # STAGE 6: START APPLICATIONS
+  # --------------------------------------------------------------------------
+  - stage: StartApplications
+    displayName: 'Start Applications'
+    dependsOn:
+      - StopApplications
+      - KernelUpdate
+      - HanaUpdate
+      - HanaMiniChecks
+      - OsPatch
+    condition: >-
+      and(
+        not(canceled()),
+        or(
+          eq('${{ parameters.do_kernel_update }}', 'true'),
+          eq('${{ parameters.do_os_update }}', 'true'),
+          eq('${{ parameters.do_hana_update }}', 'true')
+        ),
+        in(dependencies.StopApplications.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.KernelUpdate.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.HanaUpdate.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.HanaMiniChecks.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.OsPatch.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+      )
+    jobs:
+      - job: Start
+        steps:
+          - bash: sudo rm -rf "$(Build.SourcesDirectory)/reports" 2>/dev/null || true
+            displayName: 'Cleanup previous report files'
+
+          - checkout: self
+            clean: true
+
+          - bash: |
+              echo "##vso[task.setvariable variable=DO_KERNEL]${{ parameters.do_kernel_update }}"
+              echo "##vso[task.setvariable variable=DO_OS]${{ parameters.do_os_update }}"
+              echo "##vso[task.setvariable variable=DO_HANA]${{ parameters.do_hana_update }}"
+            displayName: "Set Update Flags from Checkboxes"
+
+          - bash: |
+              if [ "${{ parameters.customer }}" = "SHARED_HANA" ]; then
+                LIMIT="${{ parameters.environment }}"
+              else
+                LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+              fi
+
+              ansible-playbook playbooks/03_maintenance_start.yml \
+                -i inventory/inventory.yml \
+                -l "$LIMIT" \
+                -e @vars/common.yml \
+                -e do_kernel=$DO_KERNEL \
+                -e do_os_patch=$DO_OS \
+                -e do_hana=$DO_HANA \
+                -e do_root_keys=${{ parameters.do_root_keys }} \
+                -e staging_customer=${{ parameters.customer }} \
+                -e staging_environment=${{ parameters.environment }} \
+                -e pipeline_requested_by="$PIPELINE_REQUESTED_BY" \
+                -e pipeline_run_id="$PIPELINE_RUN_ID" \
+                -e email_recipient="${{ parameters.email_recipient }}" \
+                -v
+            displayName: 'Start SAP + HANA Systems'
+            workingDirectory: $(PROJECT_ROOT)
+
+  # --------------------------------------------------------------------------
+  # STAGE 7: VALIDATION + NOTIFICATION
+  # --------------------------------------------------------------------------
+  - stage: ValidationNotify
+    displayName: 'Validation'
+    dependsOn:
+      - PreCheck
+      - IcingaDowntime
+      - StopApplications
+      - KernelUpdate
+      - HanaUpdate
+      - HanaMiniChecks
+      - OsPatch
+      - StartApplications
+    condition: >-
+      and(
+        not(canceled()),
+        or(
+          eq('${{ parameters.do_kernel_update }}', 'true'),
+          eq('${{ parameters.do_os_update }}', 'true'),
+          eq('${{ parameters.do_hana_update }}', 'true')
+        ),
+        in(dependencies.PreCheck.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.IcingaDowntime.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.StopApplications.result, 'Succeeded', 'SucceededWithIssues'),
+        in(dependencies.KernelUpdate.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.HanaUpdate.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.HanaMiniChecks.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.OsPatch.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.StartApplications.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+      )
+    jobs:
+      - job: Validate
+        timeoutInMinutes: 60
+        steps:
+          - bash: sudo rm -rf "$(Build.SourcesDirectory)/reports" 2>/dev/null || true
+            displayName: 'Cleanup previous report files'
+
+          - checkout: self
+            clean: true
+
+          - bash: |
+              # Direct checkbox parameters - no scenario parsing needed
+              echo "##vso[task.setvariable variable=DO_KERNEL]${{ parameters.do_kernel_update }}"
+              echo "##vso[task.setvariable variable=DO_OS]${{ parameters.do_os_update }}"
+              echo "##vso[task.setvariable variable=DO_HANA]${{ parameters.do_hana_update }}"
+            displayName: "Set Update Flags from Checkboxes"
+
+          # Post-update: Icinga health gate, AFTER versions, report + email
+          - bash: |
+              if [ "${{ parameters.customer }}" = "SHARED_HANA" ]; then
+                LIMIT="${{ parameters.environment }}"
+              else
+                LIMIT="${{ parameters.customer }}_${{ parameters.environment }}"
+              fi
+
+              ansible-playbook playbooks/03_maintenance_validation.yml \
+                -i inventory/inventory.yml \
+                -l "$LIMIT" \
+                -e @vars/common.yml \
+                -e do_kernel=$DO_KERNEL \
+                -e do_os_patch=$DO_OS \
+                -e do_hana=$DO_HANA \
+                -e do_root_keys=${{ parameters.do_root_keys }} \
+                -e staging_customer=${{ parameters.customer }} \
+                -e staging_environment=${{ parameters.environment }} \
+                -e pipeline_requested_by="$PIPELINE_REQUESTED_BY" \
+                -e pipeline_run_id="$PIPELINE_RUN_ID" \
+                -e email_recipient="${{ parameters.email_recipient }}" \
+                -e "exclude_icinga_services_sap=${{ parameters.exclude_icinga_services_sap }}" \
+                -e "exclude_icinga_services_hana=${{ parameters.exclude_icinga_services_hana }}" \
+                -e skip_icinga=${{ parameters.skip_icinga }} \
+                -v
+            displayName: 'Health Check + Notify'
+            workingDirectory: $(PROJECT_ROOT)
+            env:
+              ICINGA_URL: $(ICINGA-URL)
+              ICINGA_USER: $(ICINGA-USER)
+              ICINGA_PASS: $(ICINGA-PASS)
+              AZURE_DEVOPS_PIPELINE_URL_BASE: $(AZURE-DEVOPS-PIPELINE-URL-BASE)
+
+          - bash: mkdir -p $(PROJECT_ROOT)/reports
+            condition: always()
+            displayName: 'Ensure reports directory exists'
+
+          - task: PublishBuildArtifacts@1
+            condition: always()
+            displayName: 'Publish Maintenance Report'
+            inputs:
+              PathtoPublish: '$(PROJECT_ROOT)/reports'
+              ArtifactName: 'Maintenance-Report'
+
+  # --------------------------------------------------------------------------
+  # STAGE E: FAILURE NOTIFICATION (fallback — only when pipeline breaks)
+  # --------------------------------------------------------------------------
+  # Triggers when ValidationNotify was skipped or failed due to an earlier break
+  # and at least one stage has result 'Failed'. Sends a summary email only.
+  # Icinga downtime removal is restricted to the successful validation path.
+  # --------------------------------------------------------------------------
+  - stage: FailureNotify
+    displayName: 'Failure Notification'
+    dependsOn:
+      - PreCheck
+      - IcingaDowntime
+      - StopApplications
+      - KernelUpdate
+      - HanaUpdate
+      - HanaMiniChecks
+      - OsPatch
+      - StartApplications
+      - ValidationNotify
+    condition: |
+      and(
+        not(canceled()),
+        ne('${{ parameters.email_recipient }}', 'none'),
+        in(dependencies.ValidationNotify.result, 'Skipped', 'Failed'),
+        or(
+          eq(dependencies.PreCheck.result, 'Failed'),
+          eq(dependencies.IcingaDowntime.result, 'Failed'),
+          eq(dependencies.StopApplications.result, 'Failed'),
+          eq(dependencies.KernelUpdate.result, 'Failed'),
+          eq(dependencies.HanaUpdate.result, 'Failed'),
+          eq(dependencies.HanaMiniChecks.result, 'Failed'),
+          eq(dependencies.OsPatch.result, 'Failed'),
+          eq(dependencies.StartApplications.result, 'Failed')
+        )
+      )
+    variables:
+      - name: RESULT_PRECHECK
+        value: $[ dependencies.PreCheck.result ]
+      - name: RESULT_ICINGA
+        value: $[ dependencies.IcingaDowntime.result ]
+      - name: RESULT_STOP
+        value: $[ dependencies.StopApplications.result ]
+      - name: RESULT_KERNEL
+        value: $[ dependencies.KernelUpdate.result ]
+      - name: RESULT_HANA
+        value: $[ dependencies.HanaUpdate.result ]
+      - name: RESULT_MINICHECKS
+        value: $[ dependencies.HanaMiniChecks.result ]
+      - name: RESULT_OS
+        value: $[ dependencies.OsPatch.result ]
+      - name: RESULT_START
+        value: $[ dependencies.StartApplications.result ]
+      - name: RESULT_VALIDATION
+        value: $[ dependencies.ValidationNotify.result ]
+    jobs:
+      - job: SendFailureEmail
+        steps:
+          - bash: sudo rm -rf "$(Build.SourcesDirectory)/reports" 2>/dev/null || true
+            displayName: 'Cleanup previous report files'
+
+          - checkout: self
+            clean: true
+
+          # Generate failure report (Markdown→HTML) and send via sendmail.
+          # Collects each stage result via runtime variables (RESULT_*),
+          # uses inline Python to build Markdown, converts to HTML email.
+          - bash: |
+              ORG_URL="$(System.CollectionUri)"
+              PROJECT="$(System.TeamProject)"
+              BUILD_ID="$(Build.BuildId)"
+
+              REPORT_MD="$(PROJECT_ROOT)/reports/failure_${BUILD_ID}.md"
+              REPORT_HTML="$(PROJECT_ROOT)/reports/failure_${BUILD_ID}.html"
+              mkdir -p "$(PROJECT_ROOT)/reports"
+
+              if [ "${{ parameters.customer }}" = "SHARED_HANA" ]; then
+                MAINT_TARGET="${{ parameters.environment }}"
+              else
+                MAINT_TARGET="${{ parameters.customer }}_${{ parameters.environment }}"
+              fi
+              STAGE_RESULTS='[
+              {"name": "PreCheck", "result": "$(RESULT_PRECHECK)"},
+              {"name": "IcingaDowntime", "result": "$(RESULT_ICINGA)"},
+              {"name": "StopApplications", "result": "$(RESULT_STOP)"},
+              {"name": "KernelUpdate", "result": "$(RESULT_KERNEL)"},
+              {"name": "HanaUpdate", "result": "$(RESULT_HANA)"},
+              {"name": "HanaMiniChecks", "result": "$(RESULT_MINICHECKS)"},
+              {"name": "OsPatch", "result": "$(RESULT_OS)"},
+              {"name": "StartApplications", "result": "$(RESULT_START)"},
+              {"name": "ValidationNotify", "result": "$(RESULT_VALIDATION)"}
+              ]'
+
+              FIRST_FAILED=$(python3 - "$REPORT_MD" "$BUILD_ID" "$ORG_URL" "$PROJECT" "$MAINT_TARGET" "$STAGE_RESULTS" <<'PY'
+              import json
+              import sys
+              from urllib.parse import quote
+
+              report_md, build_id, org_url, project, maint_target, stage_results_json = sys.argv[1:]
+              stages = json.loads(stage_results_json)
+              first_failed = next((stage['name'] for stage in stages if stage.get('result', '').lower() == 'failed'), 'Unknown')
+              pipeline_link = f"{org_url}{quote(project, safe='')}/_build/results?buildId={build_id}"
+
+              lines = [
+                f"# SAP Maintenance FAILED - Run {build_id}",
+                "",
+                f"**Updates:** Kernel=${{ parameters.do_kernel_update }}, OS=${{ parameters.do_os_update }}, HANA=${{ parameters.do_hana_update }}",
+                f"**Hosts:** {maint_target}",
+                f"**Failed in:** {first_failed}",
+                "",
+                "## Stage Results",
+                "",
+                "| Stage | Result |",
+                "|-------|--------|",
+              ]
+
+              for stage in stages:
+                lines.append(f"| {stage['name']} | {stage.get('result', 'Unknown').upper()} |")
+
+              lines.extend([
+                "",
+                "Please check the pipeline logs and resolve the issue.",
+                "",
+                f"[Open Pipeline Run {build_id}]({pipeline_link})",
+              ])
+
+              with open(report_md, 'w', encoding='utf-8') as handle:
+                handle.write("\n".join(lines) + "\n")
+
+              print(first_failed)
+              PY
+              )
+
+              FIRST_FAILED=$(grep 'Failed in:' "$REPORT_MD" | sed 's/.*\*\*Failed in:\*\* //')
+              TITLE="SAP Maintenance FAILED - ${FIRST_FAILED} - Run ${BUILD_ID}"
+
+              python3 "$(PROJECT_ROOT)/scripts/md_to_html_email.py" \
+                "$REPORT_MD" "$REPORT_HTML" \
+                --title "$TITLE"
+
+              EMAIL_RECIPIENT="${{ parameters.email_recipient }}"
+              (
+                echo "MIME-Version: 1.0"
+                echo "Content-Type: text/html; charset=utf-8"
+                echo "From: sap.automation@example.invalid"
+                echo "Subject: ${TITLE}"
+                echo "To: ${EMAIL_RECIPIENT}"
+                echo ""
+                cat "$REPORT_HTML"
+              ) | sendmail -t
+
+              echo "Failure notification sent to ${EMAIL_RECIPIENT}"
+            displayName: 'Send Failure Notification Email'
+

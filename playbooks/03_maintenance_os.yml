@@ -1,0 +1,108 @@
+# ============================================================================
+# SAP Maintenance: OS Patching
+# ============================================================================
+# Performs OS patching with reboot.
+# Final SAP application restart is handled by StartApplications.
+#
+# Pipeline Stage: 3a. OsPatch
+# ============================================================================
+
+- name: "SAP Maintenance: OS Patching"
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    do_kernel: false
+    do_hana: false
+    do_os_patch: false
+    inject_failure_os: false
+    _state_prefix: "{{ staging_customer | default('UNKNOWN') }}_{{ staging_environment | default('UNKNOWN') }}"
+
+  vars_files:
+    - ../vars/common.yml
+
+  tasks:
+    - name: "Log active switch values"
+      include_tasks: tasks/log_switch_state.yml
+
+    - name: "Run shared SAP discovery"
+      include_tasks: tasks/discover_sap_facts.yml
+
+    - name: "Ensure run-scoped state directory exists"
+      include_tasks: tasks/create_state_directory.yml
+
+    - name: "Run OS patching workflow"
+      block:
+        - name: "Inject OS update failure"
+          fail:
+            msg: "Injected OS update failure for rescue path validation."
+          when: inject_failure_os | bool
+
+        - name: "Stop HANA before OS patching"
+          sap.sap_operations.system:
+            instance_number: "{{ sap_info.instances[0].mSystemNumber }}"
+            state: stopped
+            wait: true
+            wait_timeout: "{{ sap_stop_timeout_seconds }}"
+          when:
+            - do_os_patch | bool
+            - is_hana | default(false)
+            - not (is_netweaver | default(false))
+
+        - name: "OS Patching"
+          include_role:
+            name: os_update
+          vars:
+            os_update_reboot: true
+          when: do_os_patch | bool
+
+        - name: "Wait for system to come back after reboot"
+          wait_for_connection:
+            delay: 30
+            timeout: 600
+          register: reboot_result
+          when: do_os_patch | bool
+
+        - name: "Fail if host did not come back"
+          fail:
+            msg: "Host {{ inventory_hostname }} did not come back after OS reboot within 600 seconds!"
+          when:
+            - do_os_patch | bool
+            - reboot_result is failed
+
+        - name: "Save OS Patch State to File"
+          copy:
+            content: |-
+              {{ {
+                'os_patched': do_os_patch | bool,
+                'os_patch_count': os_patch_count | default(0) | int,
+                'os_packages_updated': os_packages_updated | default([]),
+                'os_version_before': os_version_before | default('N/A'),
+                'os_version_after': os_version_after | default('N/A'),
+                'linux_kernel_before': linux_kernel_before | default('N/A'),
+                'linux_kernel_after': linux_kernel_after | default('N/A'),
+                'reboot_performed': (update_result.changed | default(false)) | bool,
+                'timestamp': ansible_date_time.iso8601
+              } | to_json }}
+            dest: "{{ _state_dir }}/os_state_{{ inventory_hostname }}.json"
+          delegate_to: localhost
+          when: do_os_patch | bool
+      rescue:
+        - name: "Capture OS update failure context"
+          set_fact:
+            _os_stage_failed: true
+            _os_error_task: "{{ ansible_failed_task.name | default('Unknown task') }}"
+            _os_error_message: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default(ansible_failed_result.stdout | default('Unknown error'))) }}"
+            _os_error_details: "{{ ansible_failed_result | default({}) | to_nice_yaml }}"
+        - name: "Send OS update failure notification"
+          include_tasks: tasks/send_error_notification.yml
+          vars:
+            _error_stage: "OS Update"
+            _error_task: "{{ _os_error_task }}"
+            _error_host: "{{ inventory_hostname }}"
+            _error_message: >-
+              Task "{{ _os_error_task }}" failed: {{ _os_error_message }}
+              Restart outcome: {{ 'host reboot failed or did not complete' if reboot_result is defined else 'host reboot not attempted' }}.
+            _error_details: "{{ _os_error_details }}"
+

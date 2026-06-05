@@ -1,0 +1,61 @@
+---
+
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileCopyrightText: 2023 Red Hat, Project Atmosphere
+#
+# Copyright 2023 Red Hat, Project Atmosphere
+#
+# This program is free software: you can redistribute it and/or modify it under the terms of the GNU
+# General Public License as published by the Free Software Foundation, version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+# even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# You should have received a copy of the GNU General Public License along with this program.
+# If not, see <https://www.gnu.org/licenses/>.
+
+argument_specs:
+  main:
+    short_description: Role replaces existing SAP kernel with kernel provided in SAP CAR files.
+    description:
+      - Role replaces existing SAP kernel with kernel provided in SAP CAR files.
+    options:
+      sap_kernel_update_instance:
+        description: |
+          The instance number to be managed.
+        type: str
+        required: true
+      sap_force_update:
+        description: |
+          Update the system if rolling upgrade can't be used. Stop and start the system, so there is downtime.
+        type: str
+        default: false
+        required: false
+      sap_kernel_update_sid:
+        description: |
+          SAP System ID.
+        type: str
+        required: true
+      sap_kernel_update_kernel_path:
+        description: |
+          Path to directory with installed SAP kernel.
+        type: str
+        required: true
+      sap_kernel_update_new_kernel_path:
+        description: |
+          Path to new kernel.
+        type: str
+        required: true
+      sap_kernel_update_backup:
+        description: |
+          Backup previous kernel.
+        type: str
+        default: true
+        required: false

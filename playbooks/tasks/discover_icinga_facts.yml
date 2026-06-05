@@ -1,0 +1,54 @@
+# ============================================================================
+# Icinga Configuration Tasks
+# ============================================================================
+# Sets Icinga connection facts, targets, and exclude lists.
+# Only include in playbooks that need Icinga interaction:
+#   - 03_maintenance_precheck.yml (health gate)
+#   - 03_maintenance_downtime.yml (set/remove downtimes)
+#   - 03_maintenance_validation.yml (post-check)
+#   - 03_maintenance_cleanup.yml (remove downtimes on failure)
+#
+# Requires discover_sap_facts.yml to be included first.
+# ============================================================================
+
+- name: "Set Icinga connection facts"
+  set_fact:
+    icinga_api_url: "{{ lookup('env', 'ICINGA_URL') | default('https://icinga.example.invalid:5665') }}"
+    icinga_api_user: "{{ lookup('env', 'ICINGA_USER') }}"
+    icinga_api_pass: "{{ lookup('env', 'ICINGA_PASS') }}"
+
+- name: "Configure Icinga Targets"
+  set_fact:
+    icinga_target_list: "{{ _healthcheck_str | from_yaml }}"
+    icinga_downtime_targets: "{{ _downtime_str | from_yaml }}"
+  vars:
+    _healthcheck_str: >-
+      {% if is_netweaver | default(false) and (do_kernel | bool or do_os_patch | bool or do_hana | bool) %}
+        ["{{ inventory_hostname }}"]
+      {% elif is_hana | default(false) and not is_netweaver | default(false) and (do_hana | bool or do_os_patch | bool) %}
+        ["{{ inventory_hostname }}"]
+      {% else %}
+        []
+      {% endif %}
+    _downtime_str: >-
+      {% if is_netweaver | default(false) and (do_kernel | bool or do_os_patch | bool or do_hana | bool) %}
+        ["{{ inventory_hostname }}"]
+      {% elif is_hana | default(false) and not is_netweaver | default(false) and (do_hana | bool or do_os_patch | bool) %}
+        ["{{ inventory_hostname }}"]
+      {% else %}
+        []
+      {% endif %}
+
+# Host-type-aware exclude list: SAP excludes only for NetWeaver hosts,
+# HANA excludes only for HANA hosts. Uses to_json|from_json roundtrip to
+# guarantee a proper list type (prevents string-repr that breaks the
+# regex builder in icinga_service_gate).
+- name: "Build host-type-aware Icinga exclude list"
+  set_fact:
+    current_exclude_services: "{{ _excludes_json | from_json }}"
+  vars:
+    _sap_excludes: "{{ (exclude_icinga_services_sap | default('uptime')).split(',') | map('trim') | select() | list }}"
+    _hana_excludes: "{{ (exclude_icinga_services_hana | default('uptime')).split(',') | map('trim') | select() | list }}"
+    _nw_part: "{{ _sap_excludes if ((is_netweaver | default(false) | bool) and (do_kernel | bool or do_os_patch | bool)) else [] }}"
+    _hana_part: "{{ _hana_excludes if ((is_hana | default(false) | bool) and (do_hana | bool or do_os_patch | bool)) else [] }}"
+    _excludes_json: "{{ (_nw_part + _hana_part) | unique | list | to_json }}"

@@ -1,0 +1,25 @@
+# ============================================================================
+# Azure DevOps Pipeline: ansible-lint CI
+# ============================================================================
+# Runs ansible-lint on every push and pull request to catch syntax errors,
+# best practice violations, and style issues before code reaches production.
+# ============================================================================
+trigger:
+  paths:
+    include:
+      - "**/*"
+
+pr:
+  paths:
+    include:
+      - "**/*"
+
+pool:
+  name: 'SAP Maintenance Runner'
+
+steps:
+  - script: |
+      pip install ansible-lint --quiet --user
+      export PATH="$HOME/.local/bin:$PATH"
+      ansible-lint --show-relpath
+    displayName: 'Run ansible-lint'

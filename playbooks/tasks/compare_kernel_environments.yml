@@ -1,0 +1,262 @@
+# ============================================================================
+# Compare Kernel Files between Environments
+# ============================================================================
+# Compares kernel executables between current environment and next higher:
+#   DEV → QA
+#   QA → PROD
+#
+# Generates a diff report showing:
+#   - Side-by-side versions for the 5 key kernel executables
+#   - Files only in current env (ahead)
+#   - Files only in next env (behind)
+#   - Files with different checksums (modified)
+#   - Identical files count
+# ============================================================================
+
+- name: "Define environment progression"
+  set_fact:
+    env_next_map:
+      DEV: "QA"
+      QA: "PROD"
+    current_env: "{{ sap_environment | upper }}"
+
+- name: "Determine next environment"
+  set_fact:
+    next_env: "{{ env_next_map[current_env] | default('') }}"
+    next_env_group: "{{ customer_name }}_{{ env_next_map[current_env] | default('NONE') }}"
+
+- name: "Skip if no next environment"
+  debug:
+    msg: "No higher environment to compare (current: {{ current_env }})"
+  when: next_env == ''
+
+- name: "Collect kernel checksums from current environment"
+  block:
+    - name: "Determine current environment kernel SID"
+      set_fact:
+        current_kernel_sid: >-
+          {%- set ns = namespace(sid='') -%}
+          {%- for instance in sap_info_raw.instances | default([]) -%}
+          {%-   set pnames = instance.ProcessList | default([]) | map(attribute='name') | list -%}
+          {%-   if ns.sid == '' and (pnames | intersect(['disp+work', 'msg_server', 'enqreplserver', 'sapwebdisp']) | length > 0) -%}
+          {%-     set ns.sid = instance.mSid -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ ns.sid }}
+
+    - name: "Collect current environment key executable versions"
+      shell: |
+        set -o pipefail
+        KERNEL_DIR="/usr/sap/{{ current_kernel_sid }}/SYS/exe/run"
+        cd "$KERNEL_DIR"
+        export LD_LIBRARY_PATH="$PWD"
+        for exe in disp+work tp R3trans sapstartsrv sapwebdisp; do
+          if [ -f "$exe" ]; then
+            ver=$(./"$exe" -v 2>&1 | grep -Eim1 'patch number|release|version' | sed 's/^[[:space:]]*//')
+          else
+            ver=""
+          fi
+          if [ -z "$ver" ]; then
+            ver="Version could not be determined"
+          fi
+          printf '%s|%s\n' "$exe" "$ver"
+        done
+      args:
+        executable: /bin/bash
+      register: current_kernel_versions_raw
+      changed_when: false
+      failed_when: false
+      when: current_kernel_sid != ''
+
+    - name: "Calculate MD5 checksums for current environment kernel files"
+      shell: |
+        set -o pipefail
+        KERNEL_DIR="/usr/sap/{{ current_kernel_sid }}/SYS/exe/run"
+        cd "$KERNEL_DIR"
+        find . -maxdepth 1 -type f -exec md5sum {} \; 2>/dev/null | sort -k2
+      args:
+        executable: /bin/bash
+      register: current_kernel_checksums
+      changed_when: false
+      failed_when: false
+      when: current_kernel_sid != ''
+
+    - name: "Store current environment kernel data"
+      set_fact:
+        kernel_data_current:
+          host: "{{ inventory_hostname }}"
+          env: "{{ current_env }}"
+          sid: "{{ current_kernel_sid }}"
+          executable_versions: >-
+            {%- set result = {} -%}
+            {%- for line in current_kernel_versions_raw.stdout_lines | default([]) if '|' in line -%}
+              {%- set parts = line.split('|', 1) -%}
+              {%- set _ = result.update({parts[0]: parts[1] | trim}) -%}
+            {%- endfor -%}
+            {{ result }}
+          checksums: "{{ current_kernel_checksums.stdout_lines | default([]) }}"
+      when: current_kernel_sid != ''
+  when:
+    - next_env != ''
+    - sap_info_raw.instances | default([]) | length > 0
+    - "'disp+work' in (sap_info_raw.instances | map(attribute='ProcessList') | flatten | map(attribute='name') | list)"
+
+- name: "Collect kernel checksums from next environment"
+  block:
+    - name: "Get hosts in next environment"
+      set_fact:
+        next_env_hosts: "{{ groups[next_env_group] | default([]) }}"
+
+    - name: "Select next environment comparison host"
+      set_fact:
+        next_env_host: "{{ next_env_hosts | first | default('') }}"
+      when: next_env_hosts | length > 0
+
+    - name: "Determine next environment comparison SID"
+      set_fact:
+        next_env_sid: >-
+          {{
+            kernel_data_current.sid
+            if kernel_data_current.sid in (hostvars[next_env_host].sap_sids | default([]))
+            else ((hostvars[next_env_host].sap_sids | default([])) | first | default(kernel_data_current.sid))
+          }}
+      when: next_env_host | default('') != ''
+
+    - name: "Get key executable versions from next environment app server"
+      shell: |
+        ssh {{ hostvars[next_env_host].ansible_host | default(next_env_host) }} /bin/bash <<'EOF'
+        set -o pipefail
+        KERNEL_DIR="/usr/sap/{{ next_env_sid }}/SYS/exe/run"
+        if [ ! -d "$KERNEL_DIR" ]; then
+          exit 2
+        fi
+        cd "$KERNEL_DIR"
+        export LD_LIBRARY_PATH="$PWD"
+        for exe in disp+work tp R3trans sapstartsrv sapwebdisp; do
+          if [ -f "$exe" ]; then
+            ver=$(./"$exe" -v 2>&1 | grep -Eim1 'patch number|release|version' | sed 's/^[[:space:]]*//')
+          else
+            ver=""
+          fi
+          if [ -z "$ver" ]; then
+            ver="Version could not be determined"
+          fi
+          printf '%s|%s\n' "$exe" "$ver"
+        done
+        EOF
+      args:
+        executable: /bin/bash
+      register: next_kernel_versions_raw
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      when:
+        - next_env_host | default('') != ''
+        - next_env_sid | default('') != ''
+
+    - name: "Get kernel checksums from next environment app server"
+      shell: |
+        ssh {{ hostvars[next_env_host].ansible_host | default(next_env_host) }} /bin/bash <<'EOF'
+        set -o pipefail
+        KERNEL_DIR="/usr/sap/{{ next_env_sid }}/SYS/exe/run"
+        if [ ! -d "$KERNEL_DIR" ]; then
+          exit 2
+        fi
+        cd "$KERNEL_DIR"
+        find . -maxdepth 1 -type f -exec md5sum {} \; 2>/dev/null | sort -k2
+        EOF
+      args:
+        executable: /bin/bash
+      register: next_kernel_result
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      when:
+        - next_env_host | default('') != ''
+        - next_env_sid | default('') != ''
+
+    - name: "Store next environment kernel data"
+      set_fact:
+        kernel_data_next:
+          host: "{{ next_env_host | default('N/A') }}"
+          env: "{{ next_env }}"
+          sid: "{{ next_env_sid | default('N/A') }}"
+          executable_versions: >-
+            {%- set result = {} -%}
+            {%- for line in next_kernel_versions_raw.stdout_lines | default([]) if '|' in line -%}
+              {%- set parts = line.split('|', 1) -%}
+              {%- set _ = result.update({parts[0]: parts[1] | trim}) -%}
+            {%- endfor -%}
+            {{ result }}
+          checksums: "{{ next_kernel_result.stdout_lines | default([]) }}"
+      when:
+        - next_env_host | default('') != ''
+        - next_env_sid | default('') != ''
+  when:
+    - next_env != ''
+    - kernel_data_current is defined
+
+- name: "Select current environment comparison host"
+  set_fact:
+    kernel_comparison_source_host: >-
+      {%- set ns = namespace(host='') -%}
+      {%- for host in ansible_play_hosts | sort -%}
+      {%-   if ns.host == '' and hostvars[host].kernel_data_current is defined and hostvars[host].kernel_data_next is defined -%}
+      {%-     set ns.host = host -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.host }}
+  when: next_env != ''
+  run_once: true
+
+- name: "Generate kernel diff report"
+  block:
+    - name: "Parse checksums into dictionaries"
+      set_fact:
+        current_files: "{{ dict(hostvars[kernel_comparison_source_host].kernel_data_current.checksums | default([]) | map('regex_replace', '^([a-f0-9]+)\\s+(.*)$', '\\2|||\\1') | map('split', '|||') | list) }}"
+        next_files: "{{ dict(hostvars[kernel_comparison_source_host].kernel_data_next.checksums | default([]) | map('regex_replace', '^([a-f0-9]+)\\s+(.*)$', '\\2|||\\1') | map('split', '|||') | list) }}"
+
+    - name: "Calculate differences"
+      set_fact:
+        kernel_diff:
+          current_env: "{{ current_env }}"
+          current_host: "{{ hostvars[kernel_comparison_source_host].kernel_data_current.host }}"
+          current_sid: "{{ hostvars[kernel_comparison_source_host].kernel_data_current.sid }}"
+          next_env: "{{ next_env }}"
+          next_host: "{{ hostvars[kernel_comparison_source_host].kernel_data_next.host }}"
+          next_sid: "{{ hostvars[kernel_comparison_source_host].kernel_data_next.sid }}"
+          current_executable_versions: "{{ hostvars[kernel_comparison_source_host].kernel_data_current.executable_versions | default({}) }}"
+          next_executable_versions: "{{ hostvars[kernel_comparison_source_host].kernel_data_next.executable_versions | default({}) }}"
+          only_in_current: "{{ current_files.keys() | list | difference(next_files.keys() | list) }}"
+          only_in_next: "{{ next_files.keys() | list | difference(current_files.keys() | list) }}"
+          modified: >-
+            {%- set result = [] -%}
+            {%- for file in current_files.keys() | list | intersect(next_files.keys() | list) -%}
+            {%-   if current_files[file] != next_files[file] -%}
+            {%-     set _ = result.append(file) -%}
+            {%-   endif -%}
+            {%- endfor -%}
+            {{ result }}
+          identical_count: >-
+            {%- set ns = namespace(count=0) -%}
+            {%- for file in current_files.keys() | list | intersect(next_files.keys() | list) -%}
+            {%-   if current_files[file] == next_files[file] -%}
+            {%-     set ns.count = ns.count + 1 -%}
+            {%-   endif -%}
+            {%- endfor -%}
+            {{ ns.count }}
+
+    - name: "Generate kernel comparison report"
+      template:
+        src: "{{ playbook_dir }}/../templates/kernel_env_comparison.j2"
+        dest: "{{ playbook_dir }}/../reports/kernel_comparison_{{ customer_name }}_{{ current_env }}_vs_{{ next_env }}_{{ report_time }}.md"
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+
+    - name: "Store comparison report path"
+      set_fact:
+        kernel_comparison_report: "{{ playbook_dir }}/../reports/kernel_comparison_{{ customer_name }}_{{ current_env }}_vs_{{ next_env }}_{{ report_time }}.md"
+  when:
+    - kernel_comparison_source_host | default('') != ''
+  run_once: true

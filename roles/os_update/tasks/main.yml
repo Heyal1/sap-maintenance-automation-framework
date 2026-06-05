@@ -1,0 +1,167 @@
+---
+# =============================================================================
+# Role: os_update - OS patching with logging and optional reboot
+# =============================================================================
+# Performs a full OS package update (dnf) with:
+#   - BEFORE/AFTER version capture for reporting
+#   - Centralized logging to a controller-side file (append mode)
+#   - Package exclusion support (e.g. kernel, sap-specific packages)
+#   - Dry-run mode for pre-validation without changes
+#   - Optional reboot with configurable timeouts
+#
+# Logging strategy: All operations log to a single file on the controller
+# (delegate_to: localhost). The file is touch-created once then appended to,
+# so multiple hosts writing in parallel don't overwrite each other's entries.
+# =============================================================================
+
+# === Pre-patching: Capture system versions BEFORE patching ===
+
+- name: Capture OS version before patching
+  ansible.builtin.set_fact:
+    os_version_before: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+    linux_kernel_before: "{{ ansible_kernel }}"
+    cacheable: true
+
+- name: Record maintenance start time
+  ansible.builtin.set_fact:
+    maintenance_start_time: "{{ ansible_date_time.iso8601 }}"
+    cacheable: true
+
+# === Pre-patching: Setup logging ===
+
+- name: Ensure log file exists on control node
+  ansible.builtin.file:
+    path: "{{ os_update_log_file }}"
+    state: touch
+    mode: '0644'
+  delegate_to: localhost
+  run_once: true
+
+- name: Log playbook start
+  ansible.builtin.shell: |
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting patch operation for {{ inventory_hostname }}" >> {{ os_update_log_file }}
+  delegate_to: localhost
+  run_once: false
+  changed_when: false
+
+# === Patching: Check and apply updates ===
+
+- name: Check for available updates
+  ansible.builtin.dnf:
+    list: updates
+  register: updates_available
+  changed_when: false
+  become: true
+
+- name: Log available updates
+  ansible.builtin.shell: |
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] {{ inventory_hostname }}: {{ updates_available.results | length }} updates available" >> {{ os_update_log_file }}
+  delegate_to: localhost
+  when: updates_available.results is defined
+  changed_when: false
+
+# Apply updates with exclusion list. The `join(',')` transforms the YAML
+# list ['pkg1', 'pkg2'] into "pkg1,pkg2" which is the format dnf expects
+# for the exclude parameter.
+- name: Update all packages to the latest version with exclusions
+  ansible.builtin.dnf:
+    name: "*"
+    state: latest
+    update_cache: true
+    exclude: "{{ os_update_excluded_packages | join(',') }}"
+  register: update_result
+  when: not os_update_dry_run | bool
+  become: true
+
+- name: Dry Run Message - Package Installation
+  ansible.builtin.shell: |
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] {{ inventory_hostname }}: DRY RUN ENABLED - Skipping package installation. {{ updates_available.results | length }} updates would be applied." >> {{ os_update_log_file }}
+  delegate_to: localhost
+  when:
+    - os_update_dry_run | bool
+    - updates_available.results is defined
+  changed_when: false
+
+- name: Log update result
+  ansible.builtin.shell: |
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] {{ inventory_hostname }}: Packages updated, changed={{ update_result.changed }}, excluded={{ os_update_excluded_packages | default([]) | join(',') or 'none' }}" >> {{ os_update_log_file }}
+  delegate_to: localhost
+  when:
+    - not os_update_dry_run | bool
+    - update_result is defined
+  changed_when: false
+
+# === Post-patching: Reboot if enabled ===
+
+- name: Reboot system
+  ansible.builtin.reboot:
+    msg: "Reboot initiated by Ansible after patching"
+    connect_timeout: "{{ os_update_reboot_connect_timeout }}"
+    reboot_timeout: "{{ os_update_reboot_timeout }}"
+    pre_reboot_delay: "{{ os_update_reboot_pre_delay }}"
+    post_reboot_delay: "{{ os_update_reboot_post_delay }}"
+  register: reboot_result
+  when:
+    - os_update_reboot | bool
+    - update_result is defined
+    - update_result.changed | default(false) | bool
+    - not os_update_dry_run | bool
+  become: true
+
+- name: Dry Run Message - System Reboot
+  ansible.builtin.shell: |
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] {{ inventory_hostname }}: DRY RUN ENABLED - Skipping system reboot." >> {{ os_update_log_file }}
+  delegate_to: localhost
+  when:
+    - os_update_dry_run | bool
+    - os_update_reboot | bool
+  changed_when: false
+
+- name: Log reboot result
+  ansible.builtin.shell: |
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] {{ inventory_hostname }}: Reboot performed, success={{ reboot_result.rebooted | default('skipped') }}" >> {{ os_update_log_file }}
+  delegate_to: localhost
+  when:
+    - not os_update_dry_run | bool
+    - reboot_result is defined
+  changed_when: false
+
+# === Post-patching: Capture system versions AFTER patching ===
+
+- name: Calculate patch count and capture package list
+  ansible.builtin.set_fact:
+    patch_count: "{{ updates_available.results | length if updates_available.results is defined else 0 }}"
+    os_patch_count: "{{ updates_available.results | length if updates_available.results is defined else 0 }}"
+    os_packages_updated: "{{ updates_available.results | default([]) | map(attribute='name') | list }}"
+    cacheable: true
+
+- name: Re-gather system facts after patching
+  ansible.builtin.setup:
+  when: not os_update_dry_run | bool
+
+- name: Capture OS version after patching
+  ansible.builtin.set_fact:
+    os_version_after: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+    linux_kernel_after: "{{ ansible_kernel }}"
+    cacheable: true
+
+- name: Set after versions same as before in dry run mode
+  ansible.builtin.set_fact:
+    os_version_after: "{{ os_version_before }}"
+    linux_kernel_after: "{{ linux_kernel_before }}"
+    cacheable: true
+  when: os_update_dry_run | bool
+
+- name: Record maintenance end time
+  ansible.builtin.set_fact:
+    maintenance_end_time: "{{ ansible_date_time.iso8601 }}"
+    cacheable: true
+
+# === Completion: Final logging ===
+
+- name: Log playbook completion
+  ansible.builtin.shell: |
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed patch operation for {{ inventory_hostname }}" >> {{ os_update_log_file }}
+  delegate_to: localhost
+  run_once: false
+  changed_when: false

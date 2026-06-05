@@ -1,0 +1,24 @@
+---
+# =============================================================================
+# Shared Task: log_switch_state.yml
+# =============================================================================
+# Emits the current maintenance switch values once per play for auditability.
+# =============================================================================
+
+- name: "Log active maintenance switches"
+  debug:
+    msg: |-
+      Maintenance switches:
+        do_kernel={{ do_kernel | default(false) | bool }}
+        do_hana={{ do_hana | default(false) | bool }}
+        do_os_patch={{ do_os_patch | default(false) | bool }}
+        skip_icinga={{ skip_icinga | default(false) | bool }}
+        do_root_keys={{ do_root_keys | default(false) | bool }}
+        inject_failure_precheck={{ inject_failure_precheck | default(false) | bool }}
+        inject_failure_stop={{ inject_failure_stop | default(false) | bool }}
+        inject_failure_kernel={{ inject_failure_kernel | default(false) | bool }}
+        inject_failure_hana={{ inject_failure_hana | default(false) | bool }}
+        inject_failure_os={{ inject_failure_os | default(false) | bool }}
+        inject_failure_start={{ inject_failure_start | default(false) | bool }}
+        inject_failure_validation={{ inject_failure_validation | default(false) | bool }}
+  run_once: true

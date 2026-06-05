@@ -1,0 +1,28 @@
+---
+# =============================================================================
+# Role: icinga_service_check - Generic Icinga REST API Service Query
+# =============================================================================
+
+# Shared maintenance switches keep the operator-facing toggle registry explicit.
+do_kernel: false  # Default false; do not process kernel-specific maintenance unless selected.
+do_hana: false  # Default false; do not process HANA-specific maintenance unless selected.
+do_os_patch: false  # Default false; do not trigger OS patching behavior unless selected.
+skip_icinga: false  # Default false; true bypasses Icinga checks and downtime handling.
+do_root_keys: false  # Default false; true enables HANA root key handling where supported.
+
+# Icinga REST API connection
+icinga_url: "https://icinga.example.invalid:5665"
+icinga_user: ""
+icinga_password: ""
+
+# Target host to check (Icinga host.name / host.address)
+target_hostname: "{{ inventory_hostname }}"
+target_host_address: "{{ ansible_host | default(inventory_hostname) }}"
+
+# Services to exclude from critical check (exact match on display_name)
+exclude_services:
+  - "uptime"
+
+# Services to exclude by prefix (matches display_name starting with prefix)
+# Example: ['check_hana_alerts_abc', 'check_hana_last_backup_abc']
+exclude_service_prefixes: []

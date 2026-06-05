@@ -1,0 +1,78 @@
+---
+# =============================================================================
+# Shared Task: shared_hana_stop_instance.yml
+# =============================================================================
+# Stops one shared HANA instance in tier order after stopping its tenant
+# application servers and persisting per-SID pre-maintenance state.
+# =============================================================================
+
+- name: "Resolve shared HANA database facts for instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    _shared_hana_db_instance_info: >-
+      {{
+        (
+          sap_info.instances | default([])
+          | selectattr('mSystemNumber', 'equalto', shared_hana_instance_ctx.instance_nr)
+          | list
+          | first
+        )
+        | default(
+          (
+            sap_info.instances | default([])
+            | selectattr('mSid', 'equalto', shared_hana_instance_ctx.instance_name)
+            | list
+            | first
+          ),
+          true
+        )
+      }}
+
+- name: "Fail when shared HANA database facts are missing for instance {{ shared_hana_instance_ctx.instance_name }}"
+  fail:
+    msg: >-
+      Shared HANA instance {{ shared_hana_instance_ctx.instance_name }} (HDB{{ shared_hana_instance_ctx.instance_nr }})
+      is declared in inventory but was not returned by SAP discovery on {{ inventory_hostname }}.
+  when: _shared_hana_db_instance_info.mSystemNumber is not defined
+
+- name: "Summarize shared HANA database process state for instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    _shared_hana_db_processes: "{{ _shared_hana_db_instance_info.ProcessList | default([]) }}"
+    _shared_hana_db_nonstopped_process_count: >-
+      {{
+        _shared_hana_db_instance_info.ProcessList | default([])
+        | rejectattr('dispstatus', 'equalto', 'SAPControl-GRAY')
+        | rejectattr('dispstatus', 'equalto', 'GRAY')
+        | list
+        | length
+      }}
+
+- name: "Derive shared HANA database pre-maintenance state for instance {{ shared_hana_instance_ctx.instance_name }}"
+  set_fact:
+    shared_hana_instance_db_state:
+      host: "{{ inventory_hostname }}"
+      sid: "{{ shared_hana_instance_ctx.instance_name }}"
+      instance_name: "{{ shared_hana_instance_ctx.instance_name }}"
+      instance_nr: "{{ shared_hana_instance_ctx.instance_nr }}"
+      pre_maintenance_state: "{{ 'running' if ((_shared_hana_db_nonstopped_process_count | int) > 0) else 'stopped' }}"
+      was_running: "{{ (_shared_hana_db_nonstopped_process_count | int) > 0 }}"
+      process_count_total: "{{ _shared_hana_db_processes | length }}"
+      process_count_nonstopped: "{{ _shared_hana_db_nonstopped_process_count | int }}"
+
+- name: "Stop shared tenant application dependencies for instance {{ shared_hana_instance_ctx.instance_name }}"
+  include_tasks: tasks/shared_hana_stop_tenant.yml
+  loop: "{{ shared_hana_instance_ctx.tenants | default([]) }}"
+  loop_control:
+    loop_var: shared_hana_tenant_ctx
+    label: "{{ shared_hana_tenant_ctx.sid }}"
+  vars:
+    shared_hana_instance_db_state: "{{ shared_hana_instance_db_state }}"
+
+- name: "Stop shared HANA database instance {{ shared_hana_instance_ctx.instance_name }}"
+  sap.sap_operations.system:
+    instance_number: "{{ shared_hana_instance_ctx.instance_nr }}"
+    state: stopped
+    wait: true
+    wait_timeout: "{{ sap_stop_timeout_seconds }}"
+  when:
+    - _manage_database_lifecycle | default(false) | bool
+    - shared_hana_instance_db_state.was_running | default(false) | bool

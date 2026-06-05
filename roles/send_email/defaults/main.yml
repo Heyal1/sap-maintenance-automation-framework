@@ -1,0 +1,14 @@
+---
+# Default variables for send_email role
+
+# Shared maintenance switches keep the operator-facing toggle registry explicit.
+do_kernel: false  # Default false; do not process kernel-specific maintenance unless selected.
+do_hana: false  # Default false; do not process HANA-specific maintenance unless selected.
+do_os_patch: false  # Default false; do not trigger OS patching behavior unless selected.
+skip_icinga: false  # Default false; true bypasses Icinga checks and downtime handling.
+do_root_keys: false  # Default false; true enables HANA root key handling where supported.
+
+email_sender: "sap.automation@example.invalid"
+email_subject: "SAP Automation Report"
+email_html_file: ""
+email_attachment_files: []
